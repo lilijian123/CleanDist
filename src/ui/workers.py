@@ -1,4 +1,4 @@
-"""Qt background work with results delivered through signals."""
+"""通过信号传递结果的 Qt 后台任务。"""
 from PySide6.QtCore import QObject, QRunnable, Signal
 
 

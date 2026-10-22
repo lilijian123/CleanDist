@@ -1,4 +1,4 @@
-"""Read-only directory snapshots and explicit, revalidated recycle-bin operations."""
+"""只读目录快照，以及经用户确认并重新校验的回收站操作。"""
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -8,12 +8,9 @@ import threading
 import time
 
 
-MAX_FILES = 50_000
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FileRecord:
-    path: Path
+    root: Path
     relative: str
     size: int
     modified_ns: int
@@ -23,12 +20,20 @@ class FileRecord:
 
     @classmethod
     def from_stat(cls, path, root, info):
-        return cls(path, path.relative_to(root).as_posix(), info.st_size,
+        return cls(root, path.relative_to(root).as_posix(), info.st_size,
                    info.st_mtime_ns, info.st_dev, info.st_ino, info.st_ctime_ns)
+
+    @property
+    def path(self):
+        return self.root / self.relative
 
     @property
     def fingerprint(self):
         return self.size, self.modified_ns, self.device, self.inode, self.created_ns
+
+    @property
+    def observation(self):
+        return self.size, self.modified_ns, self.created_ns
 
 
 @dataclass(frozen=True)
@@ -43,17 +48,39 @@ class DirectorySnapshot:
     timestamp: float
     elapsed: float
     free_bytes: int | None
+    directories: tuple = ()
+    backend: str = 'python'
 
     @property
     def total_bytes(self):
         return sum(record.size for record in self.files.values())
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FileChange:
     record: FileRecord
     state: str
     delta: int
+
+    @property
+    def relative(self):
+        return self.record.relative
+
+    @property
+    def name(self):
+        return self.record.relative.rsplit('/', 1)[-1]
+
+    @property
+    def size(self):
+        return self.record.size if self.count else 0
+
+    @property
+    def count(self):
+        return int(self.state not in ('已删除', '未确认'))
+
+    @property
+    def modified_ns(self):
+        return self.record.modified_ns
 
 
 @dataclass(frozen=True)
@@ -77,7 +104,7 @@ class CleanupReport:
 
     @property
     def recycled_bytes(self):
-        return sum(r.record.size for r in self.results if r.state == '成功')
+        return sum(result.record.size for result in self.results if result.state == '成功')
 
 
 def is_link(info):
@@ -93,61 +120,80 @@ def validate_plain_path(path):
     return path
 
 
-def disk_free(root):
+def free_disk_bytes(root):
     try:
         return shutil.disk_usage(root).free
     except OSError:
         return None
 
 
-def scan_directory(root, cancel=None, limit=MAX_FILES):
+@dataclass(frozen=True, slots=True)
+class ScanProgress:
+    stage: str
+    files: int
+    directories: int
+    elapsed: float
+    backend: str
+
+
+def scan_directory(root, cancel=None, limit=None, progress=None, *, backend='auto'):
     root = validate_plain_path(root)
     if not root.is_dir():
         raise ValueError('请选择一个可访问的目录')
-    if limit <= 0:
+    if limit is not None and limit <= 0:
         raise ValueError('扫描数量限制必须大于0')
     cancel = cancel or threading.Event()
+    if os.name == 'nt' and backend != 'python':
+        from .native import scan_native
+        native_snapshot = scan_native(root, cancel, limit, progress)
+        if native_snapshot is not None:
+            return native_snapshot
     start = time.monotonic()
     records, errors, stack = {}, [], [root]
+    directories = []
     skipped = 0
     truncated = False
+    last_report = 0
+    prefix_length = len(str(root).rstrip('\\/')) + 1
     while stack and not cancel.is_set() and not truncated:
         directory = stack.pop()
         try:
-            # Recheck directories before descent, not only at discovery time.
+            # 进入目录前再次校验，不能仅依赖发现目录时的检查。
             if is_link(directory.lstat()):
                 skipped += 1
                 continue
+            if directory != root:
+                directories.append(directory.relative_to(root).as_posix())
             with os.scandir(directory) as entries:
                 for entry in entries:
                     if cancel.is_set():
                         break
-                    path = Path(entry.path)
                     try:
                         info = entry.stat(follow_symlinks=False)
                         if is_link(info):
                             skipped += 1
                         elif stat.S_ISDIR(info.st_mode):
-                            stack.append(path)
+                            stack.append(Path(entry.path))
                         elif stat.S_ISREG(info.st_mode):
-                            if len(records) >= limit:
+                            if limit is not None and len(records) >= limit:
                                 truncated = True
                                 break
-                            # Windows DirEntry.stat() can cache zero dev/ino values.
-                            # Obtain a live identity so preview and execution compare the same facts.
-                            if os.name == 'nt':
-                                info = path.lstat()
-                                if is_link(info) or not stat.S_ISREG(info.st_mode):
-                                    skipped += 1
-                                    continue
-                            record = FileRecord.from_stat(path, root, info)
+                            # 枚举可低成本获取文件大小和时间；仅对用户选中的
+                            # 待清理文件读取并绑定当前文件身份。
+                            relative = entry.path[prefix_length:].replace(os.sep, '/')
+                            record = FileRecord(root, relative, info.st_size, info.st_mtime_ns,
+                                                info.st_dev, info.st_ino, info.st_ctime_ns)
                             records[record.relative] = record
                         else:
                             skipped += 1
                     except OSError as error:
                         skipped += 1
                         if len(errors) < 5:
-                            errors.append(f'{path}: {error}')
+                            errors.append(f'{entry.path}: {error}')
+            now = time.monotonic()
+            if progress and now - last_report >= .25:
+                progress(ScanProgress('兼容扫描', len(records), len(directories), now - start, 'python'))
+                last_report = now
         except OSError as error:
             if directory == root:
                 raise ValueError(f'无法读取所选目录：{error}') from error
@@ -155,12 +201,14 @@ def scan_directory(root, cancel=None, limit=MAX_FILES):
             if len(errors) < 5:
                 errors.append(f'{directory}: {error}')
     cancelled = cancel.is_set()
+    if progress:
+        progress(ScanProgress('扫描完成', len(records), len(directories), time.monotonic() - start, 'python'))
     return DirectorySnapshot(root, records, not (skipped or truncated or cancelled),
                              skipped, tuple(errors), cancelled, truncated, time.time(),
-                             time.monotonic() - start, disk_free(root))
+                             time.monotonic() - start, free_disk_bytes(root), tuple(directories))
 
 
-def diff_snapshots(previous, current):
+def diff_snapshots(previous, current, sort=True):
     if previous is not None and previous.root != current.root:
         previous = None
     changes = []
@@ -181,11 +229,13 @@ def diff_snapshots(previous, current):
             if name not in current.files:
                 changes.append(FileChange(record, '已删除' if current.complete else '未确认',
                                           -record.size if current.complete else 0))
+    if not sort:
+        return changes
     priorities = {'增长': 0, '新增': 1, '已修改': 2, '缩小': 3, '已删除': 4, '未确认': 5}
-    return sorted(changes, key=lambda c: (priorities.get(c.state, 6), -abs(c.delta), -c.record.size))
+    return sorted(changes, key=lambda change: (priorities.get(change.state, 6), -abs(change.delta), -change.record.size))
 
 
-def validate_record(root, record):
+def validate_record(root, record, *, bind=False):
     root = validate_plain_path(root)
     path = Path(os.path.abspath(record.path))
     try:
@@ -198,10 +248,12 @@ def validate_record(root, record):
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or is_link(info):
         raise ValueError('仅支持普通文件')
-    if FileRecord.from_stat(path, root, info).fingerprint != record.fingerprint:
+    live = FileRecord.from_stat(path, root, info)
+    if live.observation != record.observation or (record.inode and live.fingerprint != record.fingerprint):
         raise ValueError('文件已变化，请重新扫描和预览')
-    if not record.inode:
+    if not live.inode or (not bind and not record.inode):
         raise ValueError('无法确认文件身份，本版不执行清理')
+    return live
 
 
 def prepare_cleanup(root, records):
@@ -209,18 +261,16 @@ def prepare_cleanup(root, records):
     records = tuple(records)
     if not records:
         raise ValueError('请先勾选需要处理的文件')
-    if len({os.path.normcase(str(r.path)) for r in records}) != len(records):
+    if len({os.path.normcase(str(record.path)) for record in records}) != len(records):
         raise ValueError('清理清单包含重复文件')
-    for record in records:
-        validate_record(root, record)
-    return CleanupPlan(root, records)
+    return CleanupPlan(root, tuple(validate_record(root, record, bind=True) for record in records))
 
 
 def execute_cleanup(plan, recycler=None):
     if recycler is None:
         from send2trash import send2trash
         recycler = lambda path: send2trash(str(path))
-    before = disk_free(plan.root)
+    before = free_disk_bytes(plan.root)
     results = []
     for record in plan.records:
         try:
@@ -235,4 +285,4 @@ def execute_cleanup(plan, recycler=None):
             results.append(CleanupResult(record, '成功', '已移入回收站'))
         except Exception as error:
             results.append(CleanupResult(record, '失败', str(error)))
-    return CleanupReport(tuple(results), before, disk_free(plan.root))
+    return CleanupReport(tuple(results), before, free_disk_bytes(plan.root))

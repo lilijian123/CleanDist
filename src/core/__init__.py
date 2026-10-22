@@ -1,1 +1,1 @@
-"""Headless resource sampling and file operations."""
+"""不依赖图形界面的资源采样与文件操作。"""

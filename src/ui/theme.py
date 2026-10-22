@@ -1,4 +1,4 @@
-"""Shared application palette and Qt styles."""
+"""应用共用的配色与 Qt 样式。"""
 TEAL = '#53dfbf'
 
 MUTED = '#8b9bb1'
@@ -23,12 +23,15 @@ QPushButton#primary:hover { background: #7aeace; }
 QPushButton#primary:disabled { background: #23473f; color: #769e93; border-color: #23473f; }
 QPushButton#danger { background: #83444e; border-color: #b66b76; color: #fff1f2; }
 QLineEdit { border: 1px solid #32425a; background: #121d2e; padding: 9px; border-radius: 7px; }
+QComboBox { background: #121d2e; border: 1px solid #32425a; padding: 8px; border-radius: 7px; min-width: 90px; }
+QComboBox QAbstractItemView { background: #152133; selection-background-color: #214d4a; }
+QTreeView::item { height: 34px; }
 QTabWidget::pane { border: 0; }
 QTabBar::tab { background: transparent; color: #91a3ba; padding: 12px 24px; margin-right: 8px; border-bottom: 2px solid transparent; font-size: 14px; }
 QTabBar::tab:selected { color: #67e9ca; border-bottom: 2px solid #53dfbf; }
-QTableWidget { background: #111b2b; alternate-background-color: #152133; border: 1px solid #27364c; border-radius: 8px; gridline-color: #233047; selection-background-color: #214d4a; selection-color: #e5fff6; }
-QTableWidget::item { padding: 5px 10px; border: 0; }
-QTableWidget::item:selected { background: #214d4a; }
+QTableWidget, QTreeView { background: #111b2b; alternate-background-color: #152133; border: 1px solid #27364c; border-radius: 8px; gridline-color: #233047; selection-background-color: #214d4a; selection-color: #e5fff6; }
+QTableWidget::item, QTreeView::item { padding: 5px 10px; border: 0; }
+QTableWidget::item:selected, QTreeView::item:selected { background: #214d4a; }
 QHeaderView::section { background: #1b283b; color: #a7b9d0; padding: 9px; border: 0; border-bottom: 1px solid #344258; font-weight: 600; }
 QTableCornerButton::section { background: #1b283b; border: 0; }
 QScrollBar:vertical { background: #131e2e; width: 10px; margin: 0; }

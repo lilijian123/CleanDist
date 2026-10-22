@@ -1,4 +1,4 @@
-"""Command-line entry; load Qt only when starting the desktop interface."""
+"""命令行入口，仅在启动桌面界面时加载 Qt。"""
 import argparse
 import sys
 
@@ -13,14 +13,14 @@ def main():
     from PySide6.QtWidgets import QApplication
     from .ui.window import MainWindow
 
-    qt = QApplication(sys.argv[:1])
-    qt.setFont(QFont('Microsoft YaHei UI', 10))
+    app = QApplication(sys.argv[:1])
+    app.setFont(QFont('Microsoft YaHei UI', 10))
     window = MainWindow()
     window.show()
     if args.demo:
         QTimer.singleShot(400, window.start_demo)
-    code = qt.exec()
-    window.pool.waitForDone()
+    code = app.exec()
+    window.thread_pool.waitForDone()
     return code
 
 

@@ -1,1 +1,1 @@
-"""Windows resource observatory."""
+"""Windows 资源观察站。"""

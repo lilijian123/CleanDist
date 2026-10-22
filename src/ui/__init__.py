@@ -1,1 +1,1 @@
-"""Qt desktop interface."""
+"""Qt 桌面界面。"""

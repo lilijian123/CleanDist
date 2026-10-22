@@ -1,4 +1,4 @@
-"""Reusable Qt widgets, formatting and the memory chart."""
+"""可复用的 Qt 控件、格式化工具与内存图表。"""
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
 from .theme import MUTED, TEAL
 
 
-def size_text(value, signed=False):
+def format_size(value, signed=False):
     if value is None:
         return '不可用'
     sign = ('+' if value > 0 else '−' if value < 0 else '') if signed else ''
@@ -62,13 +62,13 @@ class Metric(QFrame):
     def __init__(self, title, note):
         super().__init__()
         self.setObjectName('card')
-        box = QVBoxLayout(self)
-        box.setContentsMargins(18, 13, 18, 13)
-        box.addWidget(label(title, 'muted'))
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 13, 18, 13)
+        layout.addWidget(label(title, 'muted'))
         self.value = label('—', 'metric')
-        box.addWidget(self.value)
+        layout.addWidget(self.value)
         self.note = label(note, 'muted')
-        box.addWidget(self.note)
+        layout.addWidget(self.note)
 
 
 class TrendChart(QWidget):
@@ -89,17 +89,17 @@ class TrendChart(QWidget):
             painter.setPen(QColor(MUTED))
             painter.drawText(area, Qt.AlignmentFlag.AlignCenter, '选择一个进程，查看真实采样趋势')
             return
-        ceiling = max(max(v for _, v in self.points) * 1.15, 1024 * 1024)
+        ceiling = max(max(value for _, value in self.points) * 1.15, 1024 * 1024)
         first, last = self.points[0][0], self.points[-1][0]
         span = max(last - first, 1)
         painter.setPen(QColor(MUTED))
         for fraction in (0, 0.5, 1):
             text_rect = QRectF(0, area.top() + area.height() * fraction - 9, 76, 20)
-            painter.drawText(text_rect, Qt.AlignmentFlag.AlignRight, size_text(ceiling * (1 - fraction)))
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignRight, format_size(ceiling * (1 - fraction)))
         painter.drawText(QPointF(area.left(), self.height() - 8), f'{last - first:.0f}秒前')
         painter.drawText(QPointF(area.right() - 30, self.height() - 8), '现在')
-        points = [QPointF(area.left() + (t - first) / span * area.width(),
-                          area.bottom() - v / ceiling * area.height()) for t, v in self.points]
+        points = [QPointF(area.left() + (timestamp - first) / span * area.width(),
+                          area.bottom() - value / ceiling * area.height()) for timestamp, value in self.points]
         path = QPainterPath(points[0])
         for point in points[1:]:
             path.lineTo(point)

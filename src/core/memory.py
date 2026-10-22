@@ -1,4 +1,4 @@
-"""Windows RSS (working set) sampling. Monitoring never changes other processes."""
+"""采样 Windows RSS（工作集内存），监测过程不修改其他进程。"""
 from collections import deque
 from dataclasses import dataclass
 import time
@@ -44,7 +44,7 @@ class MemoryHistory:
 
     def update(self, samples, now):
         active = {sample.key for sample in samples}
-        self.histories = {k: v for k, v in self.histories.items() if k in active}
+        self.histories = {key: points for key, points in self.histories.items() if key in active}
         rows = []
         for sample in samples:
             points = self.histories.setdefault(sample.key, deque(maxlen=122))
@@ -53,7 +53,7 @@ class MemoryHistory:
                 continue
             points.append((now, sample.rss))
             cutoff = now - 60
-            # Retain the most recent sample at/before the window boundary.
+            # 保留时间窗口起点处或其之前最近的一次采样。
             while len(points) > 1 and points[1][0] <= cutoff:
                 points.popleft()
             rows.append(ProcessReading(

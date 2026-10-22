@@ -1,4 +1,4 @@
-"""Convenience entry for running the desktop application from the project root."""
+"""从项目根目录启动桌面应用的便捷入口。"""
 from src.__main__ import main
 
 

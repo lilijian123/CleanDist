@@ -1,4 +1,4 @@
-"""Bounded demo: writes only inside a freshly created, marked temporary directory."""
+"""有界演示负载，仅向新建且带有标记的临时目录内写入数据。"""
 import argparse
 from pathlib import Path
 import subprocess
@@ -27,7 +27,7 @@ def run_workload(root, duration=120):
     started = time.monotonic()
     while time.monotonic() - started < duration:
         if len(chunks) < 8:
-            # Touch actual pages; reserving virtual address space alone is not an RSS demo.
+            # 实际访问内存页，仅预留虚拟地址空间无法演示 RSS 增长。
             chunks.append(bytearray(b'R' * (4 * 1024 * 1024)))
         with (root / '运行日志.log').open('ab') as stream:
             stream.write(b'demo data ' * 26000)
@@ -35,8 +35,8 @@ def run_workload(root, duration=120):
 
 
 def launch_demo(root, duration=120):
-    # The Windows venv executable is a forwarding launcher. Its RSS belongs to
-    # the proxy, not the workload; use the base interpreter for this stdlib-only demo.
+    # Windows 虚拟环境中的可执行文件仅负责转发启动，其 RSS 反映的是代理进程。
+    # 本演示仅使用标准库，因此直接使用基础解释器以测量实际负载的内存。
     executable = getattr(sys, '_base_executable', sys.executable)
     return subprocess.Popen(
         [executable, str(Path(__file__).resolve()), '--directory', str(root), '--duration', str(duration)],
