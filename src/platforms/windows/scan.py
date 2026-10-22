@@ -39,7 +39,7 @@ def get_scan_helper():
 
 
 def scan_native(root, cancel, limit, progress):
-    from .files import DirectorySnapshot, FileRecord, ScanProgress, free_disk_bytes
+    from ...core.files import DirectorySnapshot, FileRecord, ScanProgress, free_disk_bytes
     start = time.monotonic()
     files, directories, errors = {}, [], []
     skipped = 0

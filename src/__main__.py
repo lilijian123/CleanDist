@@ -2,9 +2,11 @@
 import argparse
 import sys
 
+from .platforms import system
+
 
 def main():
-    parser = argparse.ArgumentParser(description='资源观察站 Windows桌面原型')
+    parser = argparse.ArgumentParser(description=f'资源观察站 {system.NAME}桌面原型')
     parser.add_argument('--demo', action='store_true', help='启动自建临时数据的演示')
     args = parser.parse_args()
 
@@ -14,7 +16,7 @@ def main():
     from .ui.window import MainWindow
 
     app = QApplication(sys.argv[:1])
-    app.setFont(QFont('Microsoft YaHei UI', 10))
+    app.setFont(QFont(system.FONT_FAMILY, 10))
     window = MainWindow()
     window.show()
     if args.demo:

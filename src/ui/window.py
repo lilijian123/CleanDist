@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 )
 from ..core.files import execute_cleanup, prepare_cleanup, scan_directory, validate_plain_path
 from ..core.analysis import analyze_files
-from ..core.watch import DirectoryWatch
+from ..platforms import system
 from ..core.memory import MemoryHistory, sample_memory
 from .dialogs import PreviewDialog
 from .files import FileModel
@@ -27,7 +27,7 @@ from .workers import Job
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('资源观察站 · Windows原型')
+        self.setWindowTitle(f'资源观察站 · {system.NAME}原型')
         self.resize(1260, 870)
         self.setMinimumSize(1050, 760)
         self.setStyleSheet(STYLE)
@@ -85,7 +85,7 @@ class MainWindow(QMainWindow):
         header.addStretch()
         self.demo_button = button('体验演示', self.start_demo)
         header.addWidget(self.demo_button)
-        header.addWidget(label('●  Windows · 本地运行', 'pill'))
+        header.addWidget(label(f'●  {system.NAME} · 本地运行', 'pill'))
         layout.addLayout(header)
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
@@ -330,10 +330,28 @@ class MainWindow(QMainWindow):
         self.current_snapshot = self.comparison_snapshot = None
         self.file_changes = []
         self.file_analysis = None
-        self.file_model.set_analysis(None)
-        self.update_selection()
+        self.file_view_key = None
+        self.scan_progress = None
+        self.scan_pending = False
+        for card in (self.file_count_card, self.file_size_card, self.file_delta_card, self.disk_card):
+            card.value.setText('—')
+        filters = (self.file_mode, self.file_order, self.file_minimum, self.file_search)
+        for widget in filters:
+            widget.blockSignals(True)
+        self.file_mode.setCurrentIndex(0)
+        self.file_order.setCurrentIndex(0)
+        self.file_minimum.setCurrentIndex(2)
+        self.file_search.clear()
+        for widget in filters:
+            widget.blockSignals(False)
+        self.render_files()
+        self.file_view_note.setText('正在扫描新目录，完成后显示文件明细。')
+        self.last_operation.setText('大文件和增长文件仅供分析，不会被自动认定为垃圾。')
+        self.scan_note.setToolTip('')
+        self.scan_note.setText('正在切换目录，等待上一轮扫描结束…' if self.scan_busy else '正在扫描新目录…')
+        self.progress.show()
         self.monitoring = True
-        self.directory_watch = DirectoryWatch(root)
+        self.directory_watch = system.DirectoryWatch(root)
         self.file_timer.start()
         self.stop_button.setEnabled(True)
         self.refresh_button.setEnabled(True)
@@ -350,7 +368,10 @@ class MainWindow(QMainWindow):
             self.file_timer.stop()
         if hasattr(self, 'stop_button'):
             self.stop_button.setEnabled(False)
-            self.scan_note.setText('监测已停止 · 保留最近一次结果，未执行清理')
+            self.scan_note.setText('监测已停止 · 保留最近一次结果，未执行清理' if self.current_snapshot
+                                   else '扫描已停止 · 本次尚无结果')
+            if self.current_snapshot is None:
+                self.file_view_note.setText('扫描已停止，尚未生成本次结果。')
         if hasattr(self, 'progress'):
             self.progress.hide()
 
@@ -359,7 +380,7 @@ class MainWindow(QMainWindow):
             return
         self.monitoring = True
         if self.directory_watch is None:
-            self.directory_watch = DirectoryWatch(self.root)
+            self.directory_watch = system.DirectoryWatch(self.root)
         self.file_timer.start()
         self.stop_button.setEnabled(True)
         self.request_scan()
@@ -397,7 +418,10 @@ class MainWindow(QMainWindow):
 
         def failed(error):
             if generation == self.scan_generation:
-                self.scan_note.setText(f'本轮扫描失败，保留上次结果：{error}')
+                state = '保留上次结果' if self.current_snapshot else '本次尚无结果'
+                self.scan_note.setText(f'本轮扫描失败，{state}：{error}')
+                if self.current_snapshot is None:
+                    self.file_view_note.setText('扫描失败，请检查目录访问权限或重试。')
 
         def finished():
             self.scan_busy = False
@@ -434,11 +458,11 @@ class MainWindow(QMainWindow):
         if snapshot.truncated:
             quality += ' · 达到本次扫描限制'
         updated_at = datetime.fromtimestamp(snapshot.timestamp).strftime('%H:%M:%S')
-        watching = self.directory_watch is not None and self.directory_watch.handle is not None
+        watching = self.directory_watch is not None and self.directory_watch.available
         policy = '目录变化时更新 · 每5分钟校验' if watching else '变化通知不可用 · 每30秒扫描'
         if self.root.parent == self.root and watching:
             policy = '整盘变化合并更新 · 至少间隔30秒'
-        engine = '原生并行扫描' if snapshot.backend == 'windows-native' else '兼容扫描'
+        engine = system.SCAN_NAME if snapshot.backend != 'python' else '兼容扫描'
         total = time.monotonic() - self.scan_started_at
         note = f'{quality} · {updated_at} · {engine} {snapshot.elapsed:.2f}秒 / 总耗时 {total:.2f}秒 · {policy}'
         self.scan_note.setText(note)

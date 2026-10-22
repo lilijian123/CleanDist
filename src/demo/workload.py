@@ -2,7 +2,6 @@
 import argparse
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 import time
 
@@ -35,13 +34,12 @@ def run_workload(root, duration=120):
 
 
 def launch_demo(root, duration=120):
-    # Windows 虚拟环境中的可执行文件仅负责转发启动，其 RSS 反映的是代理进程。
-    # 本演示仅使用标准库，因此直接使用基础解释器以测量实际负载的内存。
-    executable = getattr(sys, '_base_executable', sys.executable)
+    from ..platforms import system
+    executable = system.python_executable()
     return subprocess.Popen(
         [executable, str(Path(__file__).resolve()), '--directory', str(root), '--duration', str(duration)],
-        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        **system.process_options(),
     )
 
 

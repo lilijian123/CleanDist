@@ -12,7 +12,7 @@ class PreviewDialog(QDialog):
         self.resize(850, 470)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 22, 22, 22)
-        layout.addWidget(label('确认移入Windows回收站', 'section'))
+        layout.addWidget(label('确认移入回收站', 'section'))
         notice = label('以下文件由你手动选择。移入回收站通常不会立即释放磁盘空间；执行前会再次核验文件。', 'muted')
         notice.setWordWrap(True)
         layout.addWidget(notice)

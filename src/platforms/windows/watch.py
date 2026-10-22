@@ -7,8 +7,6 @@ import os
 class DirectoryWatch:
     def __init__(self, root):
         self.handle = None
-        if os.name != 'nt':
-            return
         api = self.api = ctypes.WinDLL('kernel32', use_last_error=True)
         api.FindFirstChangeNotificationW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL, wintypes.DWORD]
         api.FindFirstChangeNotificationW.restype = wintypes.HANDLE
@@ -24,6 +22,10 @@ class DirectoryWatch:
         handle = api.FindFirstChangeNotificationW(path, True, 0x1 | 0x2 | 0x4 | 0x8 | 0x10)
         if handle not in (None, ctypes.c_void_p(-1).value):
             self.handle = handle
+
+    @property
+    def available(self):
+        return self.handle is not None
 
     def changed(self):
         if self.handle is None:

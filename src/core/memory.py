@@ -1,4 +1,4 @@
-"""采样 Windows RSS（工作集内存），监测过程不修改其他进程。"""
+"""通过 psutil 采样进程 RSS（驻留内存），监测过程不修改其他进程。"""
 from collections import deque
 from dataclasses import dataclass
 import time

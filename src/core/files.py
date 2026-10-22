@@ -7,6 +7,8 @@ import stat
 import threading
 import time
 
+from ..platforms import system
+
 
 @dataclass(frozen=True, slots=True)
 class FileRecord:
@@ -16,7 +18,7 @@ class FileRecord:
     modified_ns: int
     device: int
     inode: int
-    created_ns: int
+    ctime_ns: int  # 与 stat.st_ctime_ns 一致，其含义由平台决定。
 
     @classmethod
     def from_stat(cls, path, root, info):
@@ -29,11 +31,11 @@ class FileRecord:
 
     @property
     def fingerprint(self):
-        return self.size, self.modified_ns, self.device, self.inode, self.created_ns
+        return self.size, self.modified_ns, self.device, self.inode, self.ctime_ns
 
     @property
     def observation(self):
-        return self.size, self.modified_ns, self.created_ns
+        return self.size, self.modified_ns, self.ctime_ns
 
 
 @dataclass(frozen=True)
@@ -107,15 +109,11 @@ class CleanupReport:
         return sum(result.record.size for result in self.results if result.state == '成功')
 
 
-def is_link(info):
-    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, 'st_file_attributes', 0) & 0x400)
-
-
 def validate_plain_path(path):
     path = Path(os.path.abspath(path))
     for part in [*reversed(path.parents), path]:
         info = part.lstat()
-        if is_link(info):
+        if system.is_link(info):
             raise ValueError(f'不处理符号链接或重解析点：{part}')
     return path
 
@@ -143,9 +141,8 @@ def scan_directory(root, cancel=None, limit=None, progress=None, *, backend='aut
     if limit is not None and limit <= 0:
         raise ValueError('扫描数量限制必须大于0')
     cancel = cancel or threading.Event()
-    if os.name == 'nt' and backend != 'python':
-        from .native import scan_native
-        native_snapshot = scan_native(root, cancel, limit, progress)
+    if backend != 'python':
+        native_snapshot = system.scan_native(root, cancel, limit, progress)
         if native_snapshot is not None:
             return native_snapshot
     start = time.monotonic()
@@ -159,7 +156,7 @@ def scan_directory(root, cancel=None, limit=None, progress=None, *, backend='aut
         directory = stack.pop()
         try:
             # 进入目录前再次校验，不能仅依赖发现目录时的检查。
-            if is_link(directory.lstat()):
+            if system.is_link(directory.lstat()):
                 skipped += 1
                 continue
             if directory != root:
@@ -170,7 +167,7 @@ def scan_directory(root, cancel=None, limit=None, progress=None, *, backend='aut
                         break
                     try:
                         info = entry.stat(follow_symlinks=False)
-                        if is_link(info):
+                        if system.is_link(info):
                             skipped += 1
                         elif stat.S_ISDIR(info.st_mode):
                             stack.append(Path(entry.path))
@@ -246,7 +243,7 @@ def validate_record(root, record, *, bind=False):
         raise ValueError('文件路径与扫描记录不一致')
     validate_plain_path(path)
     info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or is_link(info):
+    if not stat.S_ISREG(info.st_mode) or system.is_link(info):
         raise ValueError('仅支持普通文件')
     live = FileRecord.from_stat(path, root, info)
     if live.observation != record.observation or (record.inode and live.fingerprint != record.fingerprint):
@@ -268,8 +265,7 @@ def prepare_cleanup(root, records):
 
 def execute_cleanup(plan, recycler=None):
     if recycler is None:
-        from send2trash import send2trash
-        recycler = lambda path: send2trash(str(path))
+        recycler = system.recycle
     before = free_disk_bytes(plan.root)
     results = []
     for record in plan.records:
