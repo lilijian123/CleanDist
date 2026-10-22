@@ -7,31 +7,32 @@ import time
 
 import psutil
 from PySide6.QtCore import QModelIndex, Qt, QThreadPool, QTimer
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QCursor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
+    QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
     QLineEdit, QMainWindow, QMessageBox, QProgressBar, QTabWidget, QTableWidgetItem,
-    QTextEdit, QTreeView, QVBoxLayout, QWidget,
+    QStackedWidget, QTextEdit, QTreeView, QVBoxLayout, QWidget,
 )
 from ..core.files import execute_cleanup, prepare_cleanup, scan_directory, validate_plain_path
 from ..core.analysis import analyze_files
 from ..platforms import system
 from ..core.memory import MemoryHistory, sample_memory
 from .dialogs import PreviewDialog
-from .files import FileModel
+from .files import FileModel, SizeDelegate
 from .theme import STYLE, TEAL
-from .widgets import Metric, NumberItem, TrendChart, button, label, format_size, table
+from .widgets import Metric, NumberItem, TrendChart, button, enable_pixel_scroll, label, format_size, table
 from .workers import Job
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f'资源观察站 · {system.NAME}原型')
+        self.setWindowTitle(f'资源观察站 · {system.NAME}')
         self.resize(1260, 870)
         self.setMinimumSize(1050, 760)
         self.setStyleSheet(STYLE)
         self.closing = False
+        self.centered = False
         self.jobs = {}
         self.thread_pool = QThreadPool(self)
         self.thread_pool.setMaxThreadCount(3)
@@ -54,6 +55,7 @@ class MainWindow(QMainWindow):
         self.scan_cancel = threading.Event()
         self.monitoring = False
         self.root = None
+        self.scan_kind = 'folder'
         self.cleanup_busy = False
         self.reports = deque(maxlen=20)
         self.demo_process = None
@@ -65,6 +67,22 @@ class MainWindow(QMainWindow):
         self.file_timer.timeout.connect(self.poll_directory)
         self.file_timer.setInterval(1000)
         QTimer.singleShot(0, self.request_memory)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self.centered:
+            self.centered = True
+            # 首次显示后窗口边框尺寸已知；只居中一次，不干扰用户后续拖动。
+            screen = QApplication.screenAt(QCursor.pos()) or self.screen()
+            area = screen.availableGeometry()
+            border = self.frameGeometry().size() - self.size()
+            width = max(1, area.width() - border.width() - 32)
+            height = max(1, area.height() - border.height() - 32)
+            self.setMinimumSize(min(self.minimumWidth(), width), min(self.minimumHeight(), height))
+            self.resize(min(self.width(), width), min(self.height(), height))
+            frame = self.frameGeometry()
+            frame.moveCenter(area.center())
+            self.move(frame.topLeft())
 
     def _build_ui(self):
         central = QWidget()
@@ -80,18 +98,17 @@ class MainWindow(QMainWindow):
         titles = QVBoxLayout()
         titles.setSpacing(3)
         titles.addWidget(label('资源观察站', 'title'))
-        titles.addWidget(label('看见资源变化，让每次清理都有依据', 'muted'))
         header.addLayout(titles)
         header.addStretch()
         self.demo_button = button('体验演示', self.start_demo)
         header.addWidget(self.demo_button)
-        header.addWidget(label(f'●  {system.NAME} · 本地运行', 'pill'))
+        header.addWidget(label(system.NAME, 'pill'))
         layout.addLayout(header)
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
         self._build_memory_tab()
         self._build_files_tab()
-        self.statusBar().showMessage('正在连接系统采样 · 应用不需要管理员权限')
+        self.statusBar().showMessage('正在获取系统状态…')
 
     def _build_memory_tab(self):
         page = QWidget()
@@ -99,10 +116,10 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 16, 0, 0)
         layout.setSpacing(13)
         cards = QHBoxLayout()
-        self.used_card = Metric('系统内存占用率', '系统统计口径')
-        self.available_card = Metric('可用内存', '系统可供应用使用的内存')
-        self.total_card = Metric('物理内存总量', '当前设备')
-        self.process_card = Metric('已采样进程', '每1秒刷新')
+        self.used_card = Metric('内存占用率')
+        self.available_card = Metric('可用内存')
+        self.total_card = Metric('物理内存')
+        self.process_card = Metric('进程数')
         for card in (self.used_card, self.available_card, self.total_card, self.process_card):
             cards.addWidget(card)
         layout.addLayout(cards)
@@ -118,7 +135,6 @@ class MainWindow(QMainWindow):
         line = QHBoxLayout()
         line.addWidget(label('进程工作集', 'section'))
         line.addStretch()
-        line.addWidget(label('点击进程查看趋势 · 增量保留正负号', 'muted'))
         layout.addLayout(line)
         self.memory_table = table(['进程名称', 'PID', '当前工作集 RSS', '窗口内变化', '实际观察时长'])
         self.memory_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -127,8 +143,6 @@ class MainWindow(QMainWindow):
             self.memory_table.setColumnWidth(column, width)
         self.memory_table.itemSelectionChanged.connect(self.select_process)
         layout.addWidget(self.memory_table, 1)
-        self.memory_note = label('工作集反映驻留物理内存；增长不等于内存泄漏。', 'muted')
-        layout.addWidget(self.memory_note)
         self.tabs.addTab(page, '01  内存监测')
 
     def _build_files_tab(self):
@@ -137,27 +151,51 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 16, 0, 0)
         layout.setSpacing(12)
         controls = QHBoxLayout()
+        self.scan_mode = QComboBox()
+        self.scan_mode.addItem('文件夹扫描', 'folder')
+        self.scan_mode.addItem('磁盘扫描', 'disk')
+        controls.addWidget(self.scan_mode)
+        self.target_inputs = QStackedWidget()
+        folder_controls = QWidget()
+        folder_layout = QHBoxLayout(folder_controls)
+        folder_layout.setContentsMargins(0, 0, 0, 0)
         self.root_edit = QLineEdit()
         self.root_edit.setReadOnly(True)
-        self.root_edit.setPlaceholderText('选择一个目录，观察文件大小如何变化')
-        controls.addWidget(self.root_edit, 1)
-        self.choose_button = button('选择目录', self.choose_directory, True)
-        self.refresh_button = button('立即扫描', self.resume_scan)
+        self.root_edit.setPlaceholderText('选择文件夹')
+        folder_layout.addWidget(self.root_edit, 1)
+        self.choose_button = button('选择文件夹', self.choose_directory, True)
+        folder_layout.addWidget(self.choose_button)
+        self.target_inputs.addWidget(folder_controls)
+        disk_controls = QWidget()
+        disk_layout = QHBoxLayout(disk_controls)
+        disk_layout.setContentsMargins(0, 0, 0, 0)
+        self.drive_combo = QComboBox()
+        self.drive_combo.setPlaceholderText('选择要扫描的盘符')
+        self.drive_combo.setEnabled(False)
+        disk_layout.addWidget(self.drive_combo, 1)
+        self.disk_button = button('扫描磁盘', self.scan_disk, True)
+        self.disk_button.setEnabled(False)
+        disk_layout.addWidget(self.disk_button)
+        self.target_inputs.addWidget(disk_controls)
+        controls.addWidget(self.target_inputs, 1)
+        self.scan_mode.currentIndexChanged.connect(self.change_scan_mode)
+        self.refresh_button = button('重新扫描', self.resume_scan)
         self.stop_button = button('停止监测', self.stop_directory)
         self.refresh_button.setEnabled(False)
         self.stop_button.setEnabled(False)
-        for item in (self.choose_button, self.refresh_button, self.stop_button):
+        for item in (self.refresh_button, self.stop_button):
             controls.addWidget(item)
         layout.addLayout(controls)
         cards = QHBoxLayout()
-        self.file_count_card = Metric('已扫描文件', '普通文件')
-        self.file_size_card = Metric('文件逻辑总大小', '不等同于物理磁盘占用')
-        self.file_delta_card = Metric('本轮大小变化', '相比上次采样')
-        self.disk_card = Metric('所在分区可用空间', '包含其他应用活动的影响')
+        # 文件大小为逻辑大小；分区可用空间由系统统计，包含其他应用活动的影响。
+        self.file_count_card = Metric('已扫描文件')
+        self.file_size_card = Metric('文件逻辑大小')
+        self.file_delta_card = Metric('本轮增量')
+        self.disk_card = Metric('磁盘可用空间')
         for card in (self.file_count_card, self.file_size_card, self.file_delta_card, self.disk_card):
             cards.addWidget(card)
         layout.addLayout(cards)
-        self.scan_note = label('尚未选择目录。首次扫描建立汇总，之后按目录变化更新。', 'muted')
+        self.scan_note = label('尚未开始扫描', 'muted')
         self.scan_note.setWordWrap(True)
         layout.addWidget(self.scan_note)
         self.progress = QProgressBar()
@@ -165,6 +203,15 @@ class MainWindow(QMainWindow):
         self.progress.setTextVisible(False)
         self.progress.hide()
         layout.addWidget(self.progress)
+        result_header = QHBoxLayout()
+        self.results_title = label('扫描结果', 'section')
+        result_header.addWidget(self.results_title)
+        self.file_path = QLineEdit()
+        self.file_path.setObjectName('filePath')
+        self.file_path.setReadOnly(True)
+        self.file_path.setPlaceholderText('完整路径')
+        result_header.addWidget(self.file_path, 1)
+        layout.addLayout(result_header)
         filters = QHBoxLayout()
         self.file_mode = QComboBox()
         for text, mode in [('目录层级', 'tree'), ('大文件', 'large'), ('最近增长', 'growth')]:
@@ -179,7 +226,7 @@ class MainWindow(QMainWindow):
         self.file_minimum.setEnabled(False)
         self.file_minimum.hide()
         self.file_search = QLineEdit()
-        self.file_search.setPlaceholderText('搜索文件名或相对路径，回车查看')
+        self.file_search.setPlaceholderText('搜索文件名或路径，按回车')
         self.file_search.setClearButtonEnabled(True)
         for widget in (self.file_mode, self.file_order, self.file_minimum, self.file_search):
             filters.addWidget(widget, 1 if widget is self.file_search else 0)
@@ -188,40 +235,56 @@ class MainWindow(QMainWindow):
         self.file_model = FileModel(self)
         self.file_tree.setModel(self.file_model)
         self.file_tree.setUniformRowHeights(True)
+        enable_pixel_scroll(self.file_tree)
+        self.file_tree.setIndentation(22)
+        self.file_tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.file_tree.setAlternatingRowColors(True)
         self.file_tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.file_tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.file_tree.header().setStretchLastSection(False)
         self.file_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column, width in [(1, 125), (2, 90), (3, 125), (4, 95), (5, 150)]:
+        for column, width in [(1, 190), (2, 75), (3, 115), (4, 90), (5, 145)]:
             self.file_tree.setColumnWidth(column, width)
+        self.file_tree.setItemDelegateForColumn(1, SizeDelegate(self.file_tree))
+        self.file_tree.selectionModel().currentChanged.connect(self.show_file_path)
         self.file_model.dataChanged.connect(self.update_selection)
         self.file_mode.currentIndexChanged.connect(self.render_files)
         self.file_order.currentIndexChanged.connect(self.render_files)
         self.file_minimum.currentIndexChanged.connect(self.render_files)
         self.file_search.returnPressed.connect(self.render_files)
         self.file_search.textChanged.connect(lambda text: self.render_files() if not text else None)
-        layout.addWidget(self.file_tree, 1)
+        self.results_stack = QStackedWidget()
+        self.results_stack.addWidget(self.file_tree)
+        empty_page = QWidget()
+        empty_layout = QVBoxLayout(empty_page)
+        empty_layout.addStretch()
+        self.empty_title = label('选择扫描目标', 'section')
+        self.empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addWidget(self.empty_title)
+        empty_layout.addStretch()
+        self.results_stack.addWidget(empty_page)
+        self.results_stack.setCurrentIndex(1)
+        layout.addWidget(self.results_stack, 1)
         details = QHBoxLayout()
-        self.file_view_note = label('目录和小文件分组仅作汇总，展开后勾选具体文件。', 'muted')
+        self.file_view_note = label('', 'muted')
         details.addWidget(self.file_view_note, 1)
-        self.more_button = button('加载更多明细', self.load_more_files)
-        self.more_button.setToolTip('选中目录或小文件分组，再加载该层的下一批明细')
+        self.more_button = button('加载更多', self.load_more_files)
+        self.more_button.setToolTip('加载当前层的下一批文件')
         self.more_button.setEnabled(False)
         details.addWidget(self.more_button)
         layout.addLayout(details)
-        self.selection_note = label('勾选文件后，可先查看清理预览。', 'muted')
-        layout.addWidget(self.selection_note)
-        self.last_operation = label('大文件和增长文件仅供分析，不会被自动认定为垃圾。', 'muted')
+        self.selection_note = label('未选择文件', 'muted')
+        self.last_operation = label('', 'muted')
         self.last_operation.setWordWrap(True)
+        self.last_operation.hide()
         layout.addWidget(self.last_operation)
         actions = QHBoxLayout()
-        actions.addWidget(label('清理方式：移入回收站 · 不永久删除', 'muted'))
-        actions.addStretch()
+        actions.addWidget(self.selection_note, 1)
         self.report_button = button('查看清理报告', self.show_report)
         self.report_button.setEnabled(False)
         actions.addWidget(self.report_button)
         self.preview_button = button('预览选中文件', self.preview_selected, True)
+        # 清理仅移入回收站，预览和执行前分别核验文件身份。
         self.preview_button.setEnabled(False)
         actions.addWidget(self.preview_button)
         layout.addLayout(actions)
@@ -258,41 +321,46 @@ class MainWindow(QMainWindow):
         self.available_card.value.setText(format_size(snapshot.available))
         self.total_card.value.setText(format_size(snapshot.total))
         self.process_card.value.setText(str(len(snapshot.processes)))
+        # 刷新期间只重绘一次，并在重建、排序和恢复选中行后还原用户的像素位置。
+        scroll_y = self.memory_table.verticalScrollBar().value()
+        scroll_x = self.memory_table.horizontalScrollBar().value()
+        self.memory_table.setUpdatesEnabled(False)
         self.memory_table.blockSignals(True)
-        sort_column = self.memory_table.horizontalHeader().sortIndicatorSection()
-        order = self.memory_table.horizontalHeader().sortIndicatorOrder()
-        self.memory_table.setSortingEnabled(False)
-        self.memory_table.setRowCount(len(snapshot.processes))
-        for row, process in enumerate(snapshot.processes):
-            name = QTableWidgetItem(process.name)
-            name.setData(Qt.ItemDataRole.UserRole, process.key)
-            self.memory_table.setItem(row, 0, name)
-            self.memory_table.setItem(row, 1, NumberItem(str(process.key[0]), process.key[0]))
-            self.memory_table.setItem(row, 2, NumberItem(format_size(process.rss), process.rss))
-            delta = NumberItem(format_size(process.delta, True), process.delta)
-            if process.delta:
-                delta.setForeground(QColor('#ffbd83' if process.delta > 0 else TEAL))
-            self.memory_table.setItem(row, 3, delta)
-            self.memory_table.setItem(row, 4, NumberItem(f'{process.observed_seconds:.0f} 秒', process.observed_seconds))
-        if self.selected_process not in {process.key for process in snapshot.processes}:
-            self.selected_process = snapshot.processes[0].key if snapshot.processes else None
-        if not hasattr(self, '_memory_sorted'):
-            sort_column, order = 2, Qt.SortOrder.DescendingOrder
-            self._memory_sorted = True
-        self.memory_table.setSortingEnabled(True)
-        self.memory_table.sortItems(sort_column, order)
-        for row in range(self.memory_table.rowCount()):
-            if self.memory_table.item(row, 0).data(Qt.ItemDataRole.UserRole) == self.selected_process:
-                # 刷新选中行时保留滚动位置。
-                scroll = self.memory_table.verticalScrollBar().value()
-                self.memory_table.selectRow(row)
-                self.memory_table.verticalScrollBar().setValue(scroll)
-                break
-        self.memory_table.blockSignals(False)
+        try:
+            sort_column = self.memory_table.horizontalHeader().sortIndicatorSection()
+            order = self.memory_table.horizontalHeader().sortIndicatorOrder()
+            self.memory_table.setSortingEnabled(False)
+            self.memory_table.setRowCount(len(snapshot.processes))
+            for row, process in enumerate(snapshot.processes):
+                name = QTableWidgetItem(process.name)
+                name.setData(Qt.ItemDataRole.UserRole, process.key)
+                self.memory_table.setItem(row, 0, name)
+                self.memory_table.setItem(row, 1, NumberItem(str(process.key[0]), process.key[0]))
+                self.memory_table.setItem(row, 2, NumberItem(format_size(process.rss), process.rss))
+                delta = NumberItem(format_size(process.delta, True), process.delta)
+                if process.delta:
+                    delta.setForeground(QColor('#ffbd83' if process.delta > 0 else TEAL))
+                self.memory_table.setItem(row, 3, delta)
+                self.memory_table.setItem(row, 4, NumberItem(f'{process.observed_seconds:.0f} 秒', process.observed_seconds))
+            if self.selected_process not in {process.key for process in snapshot.processes}:
+                self.selected_process = snapshot.processes[0].key if snapshot.processes else None
+            if not hasattr(self, '_memory_sorted'):
+                sort_column, order = 2, Qt.SortOrder.DescendingOrder
+                self._memory_sorted = True
+            self.memory_table.horizontalHeader().setSortIndicator(sort_column, order)
+            self.memory_table.setSortingEnabled(True)
+            for row in range(self.memory_table.rowCount()):
+                if self.memory_table.item(row, 0).data(Qt.ItemDataRole.UserRole) == self.selected_process:
+                    self.memory_table.selectRow(row)
+                    break
+        finally:
+            self.memory_table.blockSignals(False)
+            self.memory_table.verticalScrollBar().setValue(scroll_y)
+            self.memory_table.horizontalScrollBar().setValue(scroll_x)
+            self.memory_table.setUpdatesEnabled(True)
         self.draw_process()
         updated_at = datetime.fromtimestamp(snapshot.timestamp).strftime('%H:%M:%S')
-        self.memory_note.setText(f'每1秒采样 · 最近更新 {updated_at} · 不可读/已退出 {snapshot.unreadable} 项 · RSS增长不等于内存泄漏')
-        self.statusBar().showMessage(f'系统采样正常 · {updated_at}    |    目录监测：{"进行中" if self.monitoring else "未启动 / 已停止"}')
+        self.statusBar().showMessage(f'更新 {updated_at} · {"监测中" if self.monitoring else "就绪"}')
         if self.demo_process and self.demo_process.poll() is not None:
             self.demo_process = None
             self.demo_button.setText('体验演示')
@@ -310,23 +378,63 @@ class MainWindow(QMainWindow):
         self.trend_title.setText(f'{process.name} · PID {process.key[0]} · 工作集趋势' if process else '进程内存趋势')
 
     def choose_directory(self):
-        path = QFileDialog.getExistingDirectory(self, '选择要监测的目录', str(self.root or Path.home()))
+        path = QFileDialog.getExistingDirectory(self, '选择文件夹', str(self.root or Path.home()))
         if path:
             self.start_directory(Path(path))
 
+    def change_scan_mode(self, index):
+        self.target_inputs.setCurrentIndex(index)
+        if self.scan_mode.currentData() == 'disk':
+            selected = self.drive_combo.currentData()
+            self.drive_combo.clear()
+            try:
+                for root in system.list_disks():
+                    self.drive_combo.addItem(str(root), str(root))
+                self.drive_combo.setToolTip('扫描整个磁盘')
+            except OSError as error:
+                self.drive_combo.setToolTip(f'无法读取磁盘列表：{error}')
+            if selected is not None:
+                match = self.drive_combo.findData(selected)
+                if match >= 0:
+                    self.drive_combo.setCurrentIndex(match)
+            if self.drive_combo.currentIndex() < 0 and self.drive_combo.count():
+                self.drive_combo.setCurrentIndex(0)
+            available = self.drive_combo.count() > 0 and not self.cleanup_busy
+            self.drive_combo.setEnabled(available)
+            self.disk_button.setEnabled(available)
+            if not self.drive_combo.count():
+                self.drive_combo.setPlaceholderText('当前没有可选磁盘')
+
+    def scan_disk(self):
+        root = self.drive_combo.currentData()
+        if root is not None:
+            self._start_scan(Path(root), 'disk')
+
     def start_directory(self, root):
+        self._start_scan(root, 'folder')
+
+    def _start_scan(self, root, kind):
         if self.cleanup_busy:
             return
         try:
             root = validate_plain_path(root)
             if not root.is_dir():
                 raise ValueError('请选择目录')
+            if kind == 'folder' and root.parent == root:
+                raise ValueError('整盘扫描请使用“磁盘扫描”，并选择对应盘符。')
+            if kind == 'disk' and root.parent != root:
+                raise ValueError('请选择磁盘根目录')
         except (OSError, ValueError) as error:
             QMessageBox.warning(self, '无法监测目录', str(error))
             return
         self.stop_directory()
         self.root = root
-        self.root_edit.setText(str(root))
+        self.scan_kind = kind
+        self.scan_mode.setCurrentIndex(1 if kind == 'disk' else 0)
+        if kind == 'folder':
+            self.root_edit.setText(str(root))
+        self.results_title.setText('磁盘扫描结果' if kind == 'disk' else '文件夹扫描结果')
+        self.file_path.setText(str(root))
         self.current_snapshot = self.comparison_snapshot = None
         self.file_changes = []
         self.file_analysis = None
@@ -345,10 +453,11 @@ class MainWindow(QMainWindow):
         for widget in filters:
             widget.blockSignals(False)
         self.render_files()
-        self.file_view_note.setText('正在扫描新目录，完成后显示文件明细。')
-        self.last_operation.setText('大文件和增长文件仅供分析，不会被自动认定为垃圾。')
+        self.file_view_note.setText('')
+        self.empty_title.setText('正在扫描磁盘…' if kind == 'disk' else '正在扫描文件夹…')
+        self.set_operation('')
         self.scan_note.setToolTip('')
-        self.scan_note.setText('正在切换目录，等待上一轮扫描结束…' if self.scan_busy else '正在扫描新目录…')
+        self.scan_note.setText('正在切换扫描目标…' if self.scan_busy else '正在扫描…')
         self.progress.show()
         self.monitoring = True
         self.directory_watch = system.DirectoryWatch(root)
@@ -368,10 +477,11 @@ class MainWindow(QMainWindow):
             self.file_timer.stop()
         if hasattr(self, 'stop_button'):
             self.stop_button.setEnabled(False)
-            self.scan_note.setText('监测已停止 · 保留最近一次结果，未执行清理' if self.current_snapshot
-                                   else '扫描已停止 · 本次尚无结果')
+            self.scan_note.setText('监测已停止' if self.current_snapshot
+                                   else '扫描已停止')
             if self.current_snapshot is None:
-                self.file_view_note.setText('扫描已停止，尚未生成本次结果。')
+                self.file_view_note.setText('')
+                self.empty_title.setText('扫描已停止')
         if hasattr(self, 'progress'):
             self.progress.hide()
 
@@ -390,7 +500,7 @@ class MainWindow(QMainWindow):
             generation, info = self.scan_progress
             if generation == self.scan_generation and self.monitoring:
                 elapsed = time.monotonic() - self.scan_started_at
-                self.scan_note.setText(f'{info.stage} · 已扫描 {info.files:,} 个文件 / {info.directories:,} 个目录 · 已用 {elapsed:.1f}秒 · 可随时停止')
+                self.scan_note.setText(f'{info.stage} · {info.files:,} 文件 / {info.directories:,} 目录 · {elapsed:.1f}秒')
         if not self.monitoring or self.scan_busy or self.cleanup_busy:
             return
         changed = self.directory_watch.changed() if self.directory_watch else None
@@ -414,7 +524,10 @@ class MainWindow(QMainWindow):
         cancel = threading.Event()
         self.scan_cancel = cancel
         self.progress.show()
-        self.scan_note.setText('正在只读扫描 · 可随时停止，清理前需要单独确认')
+        self.scan_note.setText('正在扫描…')
+        if self.current_snapshot is None:
+            self.results_stack.setCurrentIndex(1)
+            self.empty_title.setText('正在扫描磁盘…' if self.scan_kind == 'disk' else '正在扫描文件夹…')
 
         def failed(error):
             if generation == self.scan_generation:
@@ -422,6 +535,7 @@ class MainWindow(QMainWindow):
                 self.scan_note.setText(f'本轮扫描失败，{state}：{error}')
                 if self.current_snapshot is None:
                     self.file_view_note.setText('扫描失败，请检查目录访问权限或重试。')
+                    self.empty_title.setText('扫描未完成')
 
         def finished():
             self.scan_busy = False
@@ -458,15 +572,11 @@ class MainWindow(QMainWindow):
         if snapshot.truncated:
             quality += ' · 达到本次扫描限制'
         updated_at = datetime.fromtimestamp(snapshot.timestamp).strftime('%H:%M:%S')
-        watching = self.directory_watch is not None and self.directory_watch.available
-        policy = '目录变化时更新 · 每5分钟校验' if watching else '变化通知不可用 · 每30秒扫描'
-        if self.root.parent == self.root and watching:
-            policy = '整盘变化合并更新 · 至少间隔30秒'
-        engine = system.SCAN_NAME if snapshot.backend != 'python' else '兼容扫描'
+        # 扫描引擎与自动重扫策略由平台层和 poll_directory 管理，不在界面重复解释。
         total = time.monotonic() - self.scan_started_at
-        note = f'{quality} · {updated_at} · {engine} {snapshot.elapsed:.2f}秒 / 总耗时 {total:.2f}秒 · {policy}'
+        note = f'{quality} · 耗时 {total:.1f}秒 · {updated_at}'
         self.scan_note.setText(note)
-        self.scan_note.setToolTip('\n'.join(snapshot.errors) or '符号链接、重解析点及特殊文件会跳过；未捕获两轮扫描之间的短暂变化。')
+        self.scan_note.setToolTip('\n'.join(snapshot.errors))
         self.update_selection()
 
     def render_files(self, *_):
@@ -496,11 +606,28 @@ class MainWindow(QMainWindow):
                 self.file_tree.expand(index)
         self.file_view_key = view_key
         self.file_tree.verticalScrollBar().setValue(scroll)
-        note = ('列表最多展示前500项，按需加载；可搜索相对路径缩小范围。' if self.file_model.flat
-                else '汇总包含未展开的小文件；展开查看明细，每批200项。')
+        self.results_stack.setCurrentIndex(0 if self.file_model.rowCount() else 1)
+        if self.file_analysis is not None and not self.file_model.rowCount():
+            self.empty_title.setText('暂无匹配结果')
+        self.file_path.setText(str(self.root) if self.root else '')
+        self.file_path.setToolTip(str(self.root) if self.root else '')
+        scope = '结果' if self.file_model.flat else '顶层'
+        note = f'{scope} {self.file_model.rowCount()} / {len(self.file_model.entries)} 项' if self.file_analysis else ''
+        if self.file_model.flat and len(self.file_model.entries) == 500:
+            note += ' · 前500项'
         self.file_view_note.setText(note)
         self.more_button.setEnabled(self.file_analysis is not None)
         self.update_selection()
+
+    def show_file_path(self, index, *_):
+        if index.isValid():
+            entry = index.internalPointer().entry
+            relative = entry.relative
+            if relative.startswith('\0small/'):
+                relative = relative[len('\0small/'):]
+            path = str(self.root / relative)
+            self.file_path.setText(path)
+            self.file_path.setToolTip(path)
 
     def load_more_files(self):
         index = self.file_tree.currentIndex()
@@ -515,14 +642,21 @@ class MainWindow(QMainWindow):
     def selected_records(self):
         return self.file_model.selected_records()
 
+    def set_operation(self, message):
+        self.last_operation.setText(message)
+        self.last_operation.setVisible(bool(message))
+
     def update_selection(self, *_):
         records = self.selected_records()
-        self.selection_note.setText(f'已勾选 {len(records)} 个文件 · 逻辑大小 {format_size(sum(record.size for record in records))} · 用户手动选择')
+        self.selection_note.setText(f'已选 {len(records)} 项 · {format_size(sum(record.size for record in records))}')
         self.preview_button.setEnabled(bool(records) and not self.cleanup_busy)
 
     def set_cleanup_busy(self, busy):
         self.cleanup_busy = busy
         self.choose_button.setEnabled(not busy)
+        self.scan_mode.setEnabled(not busy)
+        self.drive_combo.setEnabled(not busy and self.drive_combo.count() > 0)
+        self.disk_button.setEnabled(not busy and self.drive_combo.count() > 0)
         self.refresh_button.setEnabled(bool(self.root) and not busy)
         self.stop_button.setEnabled(self.monitoring and not busy)
         self.update_selection()
@@ -549,16 +683,16 @@ class MainWindow(QMainWindow):
 
         def failed(error):
             self.set_cleanup_busy(False)
-            self.last_operation.setText(f'清理未完成：{error}')
+            self.set_operation(f'清理未完成：{error}')
 
-        self.last_operation.setText('正在移入回收站 · 执行前重新核验每个文件')
+        self.set_operation('正在移入回收站…')
         self.run_job(lambda: execute_cleanup(plan), self.accept_cleanup, failed)
 
     def accept_cleanup(self, report):
         self.set_cleanup_busy(False)
         counts = {state: sum(result.state == state for result in report.results) for state in ('成功', '跳过', '失败')}
         text = f"已移入回收站 {counts['成功']} 项（{format_size(report.recycled_bytes)}）· 跳过 {counts['跳过']} · 失败 {counts['失败']}"
-        self.last_operation.setText(text + '。回收站未清空，不代表已释放等量空间。')
+        self.set_operation(text)
         lines = [datetime.now().strftime('%Y-%m-%d %H:%M:%S'), text,
                  '移入回收站的大小为文件逻辑大小，非实际空间收益。']
         if report.before_free is not None and report.after_free is not None:
@@ -573,7 +707,7 @@ class MainWindow(QMainWindow):
         if not self.reports:
             return
         dialog = QDialog(self)
-        dialog.setWindowTitle('清理结果 · 仅保留本次运行的最近20次记录')
+        dialog.setWindowTitle('清理报告')
         dialog.resize(850, 540)
         layout = QVBoxLayout(dialog)
         text = QTextEdit()
@@ -599,7 +733,7 @@ class MainWindow(QMainWindow):
         self.demo_button.setText('停止演示')
         self.start_directory(root)
         self.tabs.setCurrentIndex(1)
-        self.last_operation.setText('演示使用新建临时目录和独立测试进程，持续约2分钟。目录会保留供你体验清理。')
+        self.set_operation('演示目录已创建')
 
     def closeEvent(self, event):
         self.closing = True

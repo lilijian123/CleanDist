@@ -8,12 +8,12 @@ from .widgets import button, label, format_size, table
 class PreviewDialog(QDialog):
     def __init__(self, plan, parent):
         super().__init__(parent)
-        self.setWindowTitle('确认清理预览')
+        self.setWindowTitle('清理预览')
         self.resize(850, 470)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 22, 22, 22)
         layout.addWidget(label('确认移入回收站', 'section'))
-        notice = label('以下文件由你手动选择。移入回收站通常不会立即释放磁盘空间；执行前会再次核验文件。', 'muted')
+        notice = label('文件将移入回收站，不会立即释放磁盘空间。', 'muted')
         notice.setWordWrap(True)
         layout.addWidget(notice)
         file_table = table(['完整路径', '逻辑大小', '修改时间'])

@@ -43,9 +43,18 @@ def table(headers):
     item.verticalHeader().setDefaultSectionSize(36)
     item.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     item.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    enable_pixel_scroll(item)
     item.horizontalHeader().setStretchLastSection(True)
     item.horizontalHeader().setHighlightSections(False)
     return item
+
+
+def enable_pixel_scroll(view):
+    # 使用原生像素滚动，避免整行跳动，并保留触控板的细粒度位移。
+    view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+    view.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+    view.verticalScrollBar().setSingleStep(20)
+    view.horizontalScrollBar().setSingleStep(20)
 
 
 class NumberItem(QTableWidgetItem):
@@ -59,7 +68,7 @@ class NumberItem(QTableWidgetItem):
 
 
 class Metric(QFrame):
-    def __init__(self, title, note):
+    def __init__(self, title):
         super().__init__()
         self.setObjectName('card')
         layout = QVBoxLayout(self)
@@ -67,8 +76,6 @@ class Metric(QFrame):
         layout.addWidget(label(title, 'muted'))
         self.value = label('—', 'metric')
         layout.addWidget(self.value)
-        self.note = label(note, 'muted')
-        layout.addWidget(self.note)
 
 
 class TrendChart(QWidget):
@@ -87,7 +94,7 @@ class TrendChart(QWidget):
             painter.drawLine(QPointF(area.left(), y), QPointF(area.right(), y))
         if not self.points:
             painter.setPen(QColor(MUTED))
-            painter.drawText(area, Qt.AlignmentFlag.AlignCenter, '选择一个进程，查看真实采样趋势')
+            painter.drawText(area, Qt.AlignmentFlag.AlignCenter, '选择进程查看趋势')
             return
         ceiling = max(max(value for _, value in self.points) * 1.15, 1024 * 1024)
         first, last = self.points[0][0], self.points[-1][0]

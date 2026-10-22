@@ -8,6 +8,10 @@ FONT_FAMILY = 'sans-serif'
 SCAN_NAME = '兼容扫描'
 
 
+def list_disks():
+    return ()
+
+
 def scan_native(root, cancel, limit, progress):
     return None
 

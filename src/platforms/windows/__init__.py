@@ -4,6 +4,7 @@ import sys
 
 from .. import common
 from ..common import recycle
+from .disks import list_disks
 from .scan import scan_native
 from .watch import DirectoryWatch
 

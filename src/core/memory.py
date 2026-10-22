@@ -1,4 +1,7 @@
-"""通过 psutil 采样进程 RSS（驻留内存），监测过程不修改其他进程。"""
+"""通过 psutil 采样进程 RSS（驻留内存），监测过程不修改其他进程。
+
+增量仅表示观察窗口内的变化，不判断内存泄漏；进程 RSS 之和也不等于系统已用内存。
+"""
 from collections import deque
 from dataclasses import dataclass
 import time

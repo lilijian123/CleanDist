@@ -1,8 +1,9 @@
 """按需加载的树形模型，文件记录保存在工作线程生成的分析数据中，无需逐个创建控件。"""
 from datetime import datetime
 
-from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QAbstractItemModel, QModelIndex, QRectF, Qt
+from PySide6.QtGui import QColor, QFont
+from PySide6.QtWidgets import QApplication, QStyle, QStyledItemDelegate
 from ..core.analysis import DirectoryEntry, rank_files
 from .widgets import format_size
 
@@ -16,7 +17,7 @@ class Node:
 
 class FileModel(QAbstractItemModel):
     BATCH = 200
-    HEADERS = ('名称 / 相对路径', '逻辑大小', '文件数', '本轮增量', '状态', '修改时间')
+    HEADERS = ('名称 / 相对路径', '大小 / 占比', '文件数', '本轮增量', '状态', '修改时间')
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -27,10 +28,18 @@ class FileModel(QAbstractItemModel):
         self.flat = False
         self.entries = []
         self.children = {}
+        self.total_size = 0
+        style = QApplication.style()
+        self.folder_icon = style.standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+        self.file_icon = style.standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+        self.group_icon = style.standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView)
+        self.folder_font = QFont()
+        self.folder_font.setBold(True)
 
     def set_analysis(self, analysis, mode='tree', min_size=0, query='', order='size'):
         self.beginResetModel()
         self.analysis = analysis
+        self.total_size = analysis.directories[''].size if analysis else 0
         self.flat = mode != 'tree' or bool(query.strip())
         self.children = (analysis.growth_children if order == 'growth' else analysis.children) if analysis else {}
         self.entries = (rank_files(analysis, mode, min_size, query) if self.flat else self.children['']) if analysis else []
@@ -103,6 +112,8 @@ class FileModel(QAbstractItemModel):
         self.endInsertRows()
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if section == 1 and role == Qt.ItemDataRole.ToolTipRole:
+            return '占本次已扫描文件逻辑总大小的比例，不代表实际磁盘使用率。'
         if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
             return self.HEADERS[section]
 
@@ -112,6 +123,13 @@ class FileModel(QAbstractItemModel):
         entry = self._node_from_index(index).entry
         directory = isinstance(entry, DirectoryEntry)
         column = index.column()
+        share = entry.size / self.total_size if self.total_size else 0
+        if role == Qt.ItemDataRole.UserRole and column == 1:
+            return share
+        if role == Qt.ItemDataRole.DecorationRole and column == 0:
+            return self.group_icon if directory and entry.state == '明细分组' else self.folder_icon if directory else self.file_icon
+        if role == Qt.ItemDataRole.FontRole and column == 0 and directory:
+            return self.folder_font
         if role == Qt.ItemDataRole.CheckStateRole and column == 0 and not directory and entry.count:
             return Qt.CheckState.Checked if entry.relative in self.checked else Qt.CheckState.Unchecked
         if role == Qt.ItemDataRole.ToolTipRole:
@@ -124,9 +142,9 @@ class FileModel(QAbstractItemModel):
             if column == 0:
                 return entry.relative if self.flat else entry.name
             if column == 1:
-                return format_size(entry.size)
+                return f'{format_size(entry.size)}  ·  {share:.1%}'
             if column == 2:
-                return f'{entry.count:,}'
+                return f'{entry.count:,}' if directory else '—'
             if column == 3:
                 return format_size(entry.delta, True) if self.analysis.comparable else '未确认'
             if column == 4:
@@ -156,3 +174,20 @@ class FileModel(QAbstractItemModel):
 
     def selected_records(self):
         return list(self.checked.values())
+
+
+class SizeDelegate(QStyledItemDelegate):
+    """在大小文本下绘制占比条，不创建逐行控件或读取文件元数据。"""
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        share = index.data(Qt.ItemDataRole.UserRole) or 0
+        bar = QRectF(option.rect.left() + 12, option.rect.bottom() - 5,
+                     max(0, option.rect.width() - 24), 3)
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor('#2b3e50'))
+        painter.drawRoundedRect(bar, 1.5, 1.5)
+        bar.setWidth(bar.width() * min(1, max(0, share)))
+        painter.setBrush(QColor('#53dfbf'))
+        painter.drawRoundedRect(bar, 1.5, 1.5)
+        painter.restore()
