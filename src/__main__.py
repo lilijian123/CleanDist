@@ -3,10 +3,11 @@ import argparse
 import sys
 
 from .platforms import system
+from . import APP_NAME
 
 
 def main():
-    parser = argparse.ArgumentParser(description=f'资源观察站 {system.NAME}桌面原型')
+    parser = argparse.ArgumentParser(description=f'{APP_NAME} {system.NAME}桌面原型')
     parser.add_argument('--demo', action='store_true', help='启动自建临时数据的演示')
     args = parser.parse_args()
 

@@ -17,18 +17,21 @@ from ..core.files import execute_cleanup, prepare_cleanup, scan_directory, valid
 from ..core.analysis import analyze_files
 from ..platforms import system
 from ..core.memory import MemoryHistory, sample_memory
+from .. import APP_NAME
 from .dialogs import PreviewDialog
 from .apps import AppPage
 from .files import FileModel, SizeDelegate
+from .storage import StorageDialog
+from .treemap import MapPage
 from .theme import STYLE, LIGHT_STYLE, color
-from .widgets import CachedDelegate, FocusEdit, Metric, NumberItem, TrendChart, button, enable_pixel_scroll, label, format_size, number_font, table
+from .widgets import BrandMark, CachedDelegate, FocusEdit, Metric, NumberItem, TrendChart, button, enable_pixel_scroll, label, format_size, number_font, table
 from .workers import Job
 
 
 class MainWindow(QMainWindow):
     def __init__(self, settings=None):
         super().__init__()
-        self.setWindowTitle(f'资源观察站 · {system.NAME}')
+        self.setWindowTitle(f'{APP_NAME} · {system.NAME}')
         self.resize(1260, 870)
         self.setMinimumSize(1050, 760)
         self.setStyleSheet(STYLE)
@@ -98,14 +101,10 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(26, 22, 26, 12)
         layout.setSpacing(15)
         header = QHBoxLayout()
-        mark = label('R', 'brand')
-        mark.setFixedSize(52, 52)
-        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        header.addWidget(mark)
-        titles = QVBoxLayout()
-        titles.setSpacing(3)
-        titles.addWidget(label('资源观察站', 'title'))
-        header.addLayout(titles)
+        header.setSpacing(12)
+        self.brand = BrandMark()
+        header.addWidget(self.brand)
+        header.addWidget(label(APP_NAME, 'title'))
         header.addStretch()
         self.theme_combo = QComboBox()
         self.theme_combo.addItem('黑夜', 'dark')
@@ -130,6 +129,8 @@ class MainWindow(QMainWindow):
             return
         light = self.theme_combo.currentData() == 'light'
         self.setProperty('theme', 'light' if light else 'dark')
+        self.brand.update()
+        self.setWindowIcon(self.brand.icon())
         self.setStyleSheet(LIGHT_STYLE if light else STYLE)
         palette = QPalette()
         for role, dark, day in (
@@ -270,10 +271,16 @@ class MainWindow(QMainWindow):
         self.file_path.setReadOnly(True)
         self.file_path.setPlaceholderText('完整路径')
         result_header.addWidget(self.file_path, 1)
+        self.usage_button = button('空间分析', lambda: self.open_storage('usage'))
+        self.duplicate_button = button('识别重复', lambda: self.open_storage('duplicates'))
+        self.usage_button.setEnabled(False)
+        self.duplicate_button.setEnabled(False)
+        result_header.addWidget(self.usage_button)
+        result_header.addWidget(self.duplicate_button)
         layout.addLayout(result_header)
         filters = QHBoxLayout()
         self.file_mode = QComboBox()
-        for text, mode in [('目录层级', 'tree'), ('大文件', 'large'), ('最近增长', 'growth')]:
+        for text, mode in [('目录层级', 'tree'), ('大文件', 'large'), ('最近增长', 'growth'), ('空间占用矩阵', 'map')]:
             self.file_mode.addItem(text, mode)
         self.file_order = QComboBox()
         self.file_order.addItem('按占用排序', 'size')
@@ -324,6 +331,9 @@ class MainWindow(QMainWindow):
         empty_layout.addWidget(self.empty_title)
         empty_layout.addStretch()
         self.results_stack.addWidget(empty_page)
+        self.map_page = MapPage()
+        self.map_page.map.file_clicked.connect(self.show_map_file)
+        self.results_stack.addWidget(self.map_page)
         self.results_stack.setCurrentIndex(1)
         layout.addWidget(self.results_stack, 1)
         details = QHBoxLayout()
@@ -498,6 +508,8 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as error:
             QMessageBox.warning(self, '无法监测目录', str(error))
             return
+        for dialog in self.findChildren(StorageDialog):
+            dialog.close()
         self.stop_directory()
         self.root = root
         self.scan_kind = kind
@@ -629,6 +641,10 @@ class MainWindow(QMainWindow):
         if self.closing or generation != self.scan_generation or not self.monitoring or result is None or self.cleanup_busy:
             return
         snapshot = result.snapshot
+        if self.current_snapshot is None and self.scan_kind == 'disk':
+            self.file_mode.blockSignals(True)
+            self.file_mode.setCurrentIndex(self.file_mode.findData('map'))
+            self.file_mode.blockSignals(False)
         self.file_analysis = result
         self.file_changes = result.changes
         self.current_snapshot = snapshot
@@ -652,6 +668,8 @@ class MainWindow(QMainWindow):
 
     def render_files(self, *_):
         mode = self.file_mode.currentData()
+        is_map = mode == 'map'
+        self.file_search.setEnabled(not is_map)
         self.file_minimum.setEnabled(mode == 'large')
         self.file_minimum.setVisible(mode == 'large')
         self.file_order.setEnabled(mode == 'tree' and not self.file_search.text().strip())
@@ -664,8 +682,8 @@ class MainWindow(QMainWindow):
             if preserve and self.file_tree.isExpanded(index):
                 expanded.append((key, len(node.children)))
         root_rows = self.file_model.rowCount() if preserve else 0
-        self.file_model.set_analysis(self.file_analysis, mode, self.file_minimum.currentData(),
-                                     self.file_search.text(), self.file_order.currentData())
+        self.file_model.set_analysis(self.file_analysis, 'tree' if is_map else mode, self.file_minimum.currentData(),
+                                     '' if is_map else self.file_search.text(), self.file_order.currentData())
         while self.file_model.rowCount() < root_rows and self.file_model.has_more():
             self.file_model.load_more()
         for key, count in sorted(expanded, key=lambda item: item[0].count('/')):
@@ -678,6 +696,9 @@ class MainWindow(QMainWindow):
         self.file_view_key = view_key
         self.file_tree.verticalScrollBar().setValue(scroll)
         self.results_stack.setCurrentIndex(0 if self.file_model.rowCount() else 1)
+        self.map_page.set_analysis(self.file_analysis)
+        if is_map and self.file_analysis is not None:
+            self.results_stack.setCurrentWidget(self.map_page)
         if self.file_analysis is not None and not self.file_model.rowCount():
             self.empty_title.setText('暂无匹配结果')
         self.file_path.setText(str(self.root) if self.root else '')
@@ -686,9 +707,28 @@ class MainWindow(QMainWindow):
         note = f'{scope} {self.file_model.rowCount()} / {len(self.file_model.entries)} 项' if self.file_analysis else ''
         if self.file_model.flat and len(self.file_model.entries) == 500:
             note += ' · 前500项'
-        self.file_view_note.setText(note)
-        self.more_button.setEnabled(self.file_analysis is not None)
+        self.file_view_note.setText('矩形面积表示本次已扫描文件的逻辑大小' if is_map and self.file_analysis else note)
+        self.more_button.setEnabled(self.file_analysis is not None and not is_map)
+        self.more_button.setVisible(not is_map)
+        self.usage_button.setEnabled(self.current_snapshot is not None and not self.cleanup_busy)
+        self.duplicate_button.setEnabled(self.current_snapshot is not None and not self.cleanup_busy)
         self.update_selection()
+
+    def show_map_file(self, relative):
+        if self.root is not None:
+            path = str(self.root / relative)
+            self.file_path.setText(path)
+            self.file_path.setToolTip(path)
+
+    def open_storage(self, mode):
+        if self.current_snapshot is None or self.cleanup_busy or self.closing:
+            return
+        previous = getattr(self, 'storage_dialog', None)
+        if previous is not None and not previous.closed:
+            previous.close()
+        self.storage_dialog = StorageDialog(self.current_snapshot, mode, self.run_job, self)
+        self.storage_dialog.show()
+        self.storage_dialog.start()
 
     def show_file_path(self, index, *_):
         if index.isValid():
@@ -730,6 +770,8 @@ class MainWindow(QMainWindow):
         self.disk_button.setEnabled(not busy and self.drive_combo.count() > 0)
         self.refresh_button.setEnabled(bool(self.root) and not busy)
         self.stop_button.setEnabled(self.monitoring and not busy)
+        self.usage_button.setEnabled(self.current_snapshot is not None and not busy)
+        self.duplicate_button.setEnabled(self.current_snapshot is not None and not busy)
         self.update_selection()
 
     def preview_selected(self):
@@ -808,6 +850,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.closing = True
+        for dialog in self.findChildren(StorageDialog):
+            dialog.close()
         self.apps_page.shutdown()
         self.memory_timer.stop()
         self.stop_directory()

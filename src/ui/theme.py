@@ -8,7 +8,6 @@ QWidget { background: #151515; color: #d6d6d1; font-size: 10pt; font-weight: 360
 QMainWindow, QDialog { background: #151515; }
 QLabel { background: transparent; }
 QLabel#title { font-size: 27px; font-weight: 660; color: #e5e5df; }
-QLabel#brand { background: #20201e; color: #b8d1bf; font-size: 25px; font-weight: 760; border-radius: 14px; }
 QLabel#muted { color: #8b8e87; }
 QLabel#pill { color: #a8c8b5; background: #20201e; border: 0; border-radius: 12px; padding: 6px 12px; }
 QFrame#card { background: #1a1a19; border: 0; border-radius: 13px; }

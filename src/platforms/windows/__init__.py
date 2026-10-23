@@ -8,6 +8,7 @@ from .apps import scan_apps
 from .icons import load_app_icons
 from .disks import list_disks
 from .scan import scan_native
+from .storage import allocated_bytes, open_metadata
 from .watch import DirectoryWatch
 
 

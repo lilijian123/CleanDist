@@ -4,7 +4,7 @@ from functools import lru_cache
 from math import ceil
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QFrame, QLabel, QLineEdit, QPushButton, QTableWidget,
     QStyledItemDelegate, QStyleOptionViewItem, QTableWidgetItem, QVBoxLayout, QWidget,
@@ -28,6 +28,46 @@ def label(text='', name=None):
     if name:
         item.setObjectName(name)
     return item
+
+
+class BrandMark(QWidget):
+    """无字母和底块的磁盘标记，原生矢量绘制以适配主题与缩放。"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(44, 44)
+        self.setAccessibleName('CleanDist 磁盘标志')
+
+    def draw(self, painter):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        shade = QColor(color(self, 'accent'))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(shade, 2.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawArc(QRectF(6, 6, 32, 32), 45 * 16, 285 * 16)
+        painter.drawLine(QPointF(29, 15), QPointF(37, 7))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(shade)
+        painter.drawEllipse(QPointF(37, 7), 2.7, 2.7)
+        painter.drawEllipse(QPointF(22, 22), 2, 2)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        shade.setAlpha(125)
+        painter.setPen(QPen(shade, 1.6))
+        painter.drawEllipse(QPointF(22, 22), 7, 7)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        self.draw(painter)
+
+    def icon(self):
+        icon = QIcon()
+        for size in (32, 64, 128):
+            pixmap = QPixmap(size, size)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.scale(size / 44, size / 44)
+            self.draw(painter)
+            painter.end()
+            icon.addPixmap(pixmap)
+        return icon
 
 
 def button(text, callback, primary=False):
