@@ -12,6 +12,14 @@ def list_disks():
     return ()
 
 
+def scan_apps(roots=None, cancel=None, progress=None):
+    raise NotImplementedError('当前平台尚未适配应用扫描')
+
+
+def load_app_icons(requests, cancel):
+    return {key: b'' for key in requests if not cancel.is_set()}
+
+
 def scan_native(root, cancel, limit, progress):
     return None
 

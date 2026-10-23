@@ -6,11 +6,11 @@ import threading
 import time
 
 import psutil
-from PySide6.QtCore import QModelIndex, Qt, QThreadPool, QTimer
-from PySide6.QtGui import QColor, QCursor
+from PySide6.QtCore import QModelIndex, QSettings, Qt, QThreadPool, QTimer
+from PySide6.QtGui import QColor, QCursor, QFont, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
-    QLineEdit, QMainWindow, QMessageBox, QProgressBar, QTabWidget, QTableWidgetItem,
+    QMainWindow, QMessageBox, QProgressBar, QTabWidget, QTableWidgetItem,
     QStackedWidget, QTextEdit, QTreeView, QVBoxLayout, QWidget,
 )
 from ..core.files import execute_cleanup, prepare_cleanup, scan_directory, validate_plain_path
@@ -18,19 +18,23 @@ from ..core.analysis import analyze_files
 from ..platforms import system
 from ..core.memory import MemoryHistory, sample_memory
 from .dialogs import PreviewDialog
+from .apps import AppPage
 from .files import FileModel, SizeDelegate
-from .theme import STYLE, TEAL
-from .widgets import Metric, NumberItem, TrendChart, button, enable_pixel_scroll, label, format_size, table
+from .theme import STYLE, LIGHT_STYLE, color
+from .widgets import CachedDelegate, FocusEdit, Metric, NumberItem, TrendChart, button, enable_pixel_scroll, label, format_size, number_font, table
 from .workers import Job
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, settings=None):
         super().__init__()
         self.setWindowTitle(f'资源观察站 · {system.NAME}')
         self.resize(1260, 870)
         self.setMinimumSize(1050, 760)
         self.setStyleSheet(STYLE)
+        self.setFont(number_font())
+        self.settings = settings if settings is not None else QSettings(
+            QSettings.Format.IniFormat, QSettings.Scope.UserScope, 'ResourceObserver', 'settings')
         self.closing = False
         self.centered = False
         self.jobs = {}
@@ -60,6 +64,9 @@ class MainWindow(QMainWindow):
         self.reports = deque(maxlen=20)
         self.demo_process = None
         self._build_ui()
+        self.theme_combo.setCurrentIndex(1 if self.settings.value('theme', 'dark') == 'light' else 0)
+        self.apply_theme()
+        self.tabs.currentChanged.connect(lambda index: self.render_memory() if index == 0 else None)
         self.memory_timer = QTimer(self)
         self.memory_timer.timeout.connect(self.request_memory)
         self.memory_timer.start(1000)
@@ -100,6 +107,12 @@ class MainWindow(QMainWindow):
         titles.addWidget(label('资源观察站', 'title'))
         header.addLayout(titles)
         header.addStretch()
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem('黑夜', 'dark')
+        self.theme_combo.addItem('白天', 'light')
+        self.theme_combo.setToolTip('选择界面主题')
+        self.theme_combo.currentIndexChanged.connect(self.apply_theme)
+        header.addWidget(self.theme_combo)
         self.demo_button = button('体验演示', self.start_demo)
         header.addWidget(self.demo_button)
         header.addWidget(label(system.NAME, 'pill'))
@@ -108,7 +121,53 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.tabs)
         self._build_memory_tab()
         self._build_files_tab()
+        self.apps_page = AppPage(self.run_job)
+        self.tabs.addTab(self.apps_page, '03  应用扫描')
         self.statusBar().showMessage('正在获取系统状态…')
+
+    def apply_theme(self, *_):
+        if not hasattr(self, 'apps_page'):
+            return
+        light = self.theme_combo.currentData() == 'light'
+        self.setProperty('theme', 'light' if light else 'dark')
+        self.setStyleSheet(LIGHT_STYLE if light else STYLE)
+        palette = QPalette()
+        for role, dark, day in (
+            (QPalette.ColorRole.Window, '#151515', '#fcfcfb'),
+            (QPalette.ColorRole.Base, '#151515', '#fcfcfb'),
+            (QPalette.ColorRole.AlternateBase, '#1a1a19', '#f5f5f3'),
+            (QPalette.ColorRole.WindowText, '#d6d6d1', '#30302d'),
+            (QPalette.ColorRole.Text, '#d6d6d1', '#30302d'),
+            (QPalette.ColorRole.Button, '#20201e', '#efefec'),
+            (QPalette.ColorRole.ButtonText, '#d6d6d1', '#30302d'),
+            (QPalette.ColorRole.Highlight, '#293029', '#e0e9df'),
+            (QPalette.ColorRole.HighlightedText, '#e1e8de', '#253d2b'),
+            (QPalette.ColorRole.ToolTipBase, '#20201e', '#efefec'),
+            (QPalette.ColorRole.ToolTipText, '#d6d6d1', '#30302d'),
+        ):
+            palette.setColor(role, QColor(day if light else dark))
+        self.setPalette(palette)
+        font = number_font(light)
+        self.setFont(font)
+        self.file_model.number_font = self.apps_page.model.number_font = font
+        self.file_model.folder_font.setWeight(QFont.Weight(700 if light else 660))
+        for metric in self.findChildren(Metric):
+            metric.value.setFont(font)
+        for row in range(self.memory_table.rowCount()):
+            for column in range(1, self.memory_table.columnCount()):
+                item = self.memory_table.item(row, column)
+                if item:
+                    item.setFont(font)
+            delta = self.memory_table.item(row, 3)
+            if delta and delta.data(Qt.ItemDataRole.UserRole + 1):
+                delta.setForeground(QColor(color(self, 'positive' if delta.data(Qt.ItemDataRole.UserRole + 1) > 0 else 'accent')))
+        for delegate in self.findChildren(CachedDelegate):
+            delegate.cache.clear()
+        self.chart.update()
+        self.file_tree.viewport().update()
+        self.apps_page.table.viewport().update()
+        self.settings.setValue('theme', 'light' if light else 'dark')
+        self.settings.sync()
 
     def _build_memory_tab(self):
         page = QWidget()
@@ -159,7 +218,7 @@ class MainWindow(QMainWindow):
         folder_controls = QWidget()
         folder_layout = QHBoxLayout(folder_controls)
         folder_layout.setContentsMargins(0, 0, 0, 0)
-        self.root_edit = QLineEdit()
+        self.root_edit = FocusEdit()
         self.root_edit.setReadOnly(True)
         self.root_edit.setPlaceholderText('选择文件夹')
         folder_layout.addWidget(self.root_edit, 1)
@@ -206,7 +265,7 @@ class MainWindow(QMainWindow):
         result_header = QHBoxLayout()
         self.results_title = label('扫描结果', 'section')
         result_header.addWidget(self.results_title)
-        self.file_path = QLineEdit()
+        self.file_path = FocusEdit()
         self.file_path.setObjectName('filePath')
         self.file_path.setReadOnly(True)
         self.file_path.setPlaceholderText('完整路径')
@@ -225,7 +284,7 @@ class MainWindow(QMainWindow):
         self.file_minimum.setCurrentIndex(2)
         self.file_minimum.setEnabled(False)
         self.file_minimum.hide()
-        self.file_search = QLineEdit()
+        self.file_search = FocusEdit()
         self.file_search.setPlaceholderText('搜索文件名或路径，按回车')
         self.file_search.setClearButtonEnabled(True)
         for widget in (self.file_mode, self.file_order, self.file_minimum, self.file_search):
@@ -234,7 +293,9 @@ class MainWindow(QMainWindow):
         self.file_tree = QTreeView()
         self.file_model = FileModel(self)
         self.file_tree.setModel(self.file_model)
+        self.file_tree.setItemDelegate(CachedDelegate(self.file_tree))
         self.file_tree.setUniformRowHeights(True)
+        self.file_tree.setAnimated(True)
         enable_pixel_scroll(self.file_tree)
         self.file_tree.setIndentation(22)
         self.file_tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
@@ -317,6 +378,19 @@ class MainWindow(QMainWindow):
 
     def accept_memory(self, snapshot):
         self.memory_snapshot = snapshot
+        # 后台继续采样，隐藏页面只保存最新快照，切回时再绘制进程表。
+        if self.tabs.currentIndex() == 0:
+            self.render_memory()
+        updated_at = datetime.fromtimestamp(snapshot.timestamp).strftime('%H:%M:%S')
+        self.statusBar().showMessage(f'更新 {updated_at} · {"监测中" if self.monitoring else "就绪"}')
+        if self.demo_process and self.demo_process.poll() is not None:
+            self.demo_process = None
+            self.demo_button.setText('体验演示')
+
+    def render_memory(self):
+        snapshot = self.memory_snapshot
+        if snapshot is None:
+            return
         self.used_card.value.setText(f'{snapshot.percent:.1f}%')
         self.available_card.value.setText(format_size(snapshot.available))
         self.total_card.value.setText(format_size(snapshot.total))
@@ -339,9 +413,11 @@ class MainWindow(QMainWindow):
                 self.memory_table.setItem(row, 2, NumberItem(format_size(process.rss), process.rss))
                 delta = NumberItem(format_size(process.delta, True), process.delta)
                 if process.delta:
-                    delta.setForeground(QColor('#ffbd83' if process.delta > 0 else TEAL))
+                    delta.setForeground(QColor(color(self, 'positive' if process.delta > 0 else 'accent')))
                 self.memory_table.setItem(row, 3, delta)
                 self.memory_table.setItem(row, 4, NumberItem(f'{process.observed_seconds:.0f} 秒', process.observed_seconds))
+                for column in range(1, 5):
+                    self.memory_table.item(row, column).setFont(number_font(self.property('theme') == 'light'))
             if self.selected_process not in {process.key for process in snapshot.processes}:
                 self.selected_process = snapshot.processes[0].key if snapshot.processes else None
             if not hasattr(self, '_memory_sorted'):
@@ -359,11 +435,6 @@ class MainWindow(QMainWindow):
             self.memory_table.horizontalScrollBar().setValue(scroll_x)
             self.memory_table.setUpdatesEnabled(True)
         self.draw_process()
-        updated_at = datetime.fromtimestamp(snapshot.timestamp).strftime('%H:%M:%S')
-        self.statusBar().showMessage(f'更新 {updated_at} · {"监测中" if self.monitoring else "就绪"}')
-        if self.demo_process and self.demo_process.poll() is not None:
-            self.demo_process = None
-            self.demo_button.setText('体验演示')
 
     def select_process(self):
         selected = self.memory_table.selectionModel().selectedRows()
@@ -737,6 +808,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.closing = True
+        self.apps_page.shutdown()
         self.memory_timer.stop()
         self.stop_directory()
         if self.demo_process and self.demo_process.poll() is None:

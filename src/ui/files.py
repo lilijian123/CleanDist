@@ -1,11 +1,12 @@
 """按需加载的树形模型，文件记录保存在工作线程生成的分析数据中，无需逐个创建控件。"""
 from datetime import datetime
 
-from PySide6.QtCore import QAbstractItemModel, QModelIndex, QRectF, Qt
+from PySide6.QtCore import QAbstractItemModel, QModelIndex, QObject, QRectF, Qt
 from PySide6.QtGui import QColor, QFont
-from PySide6.QtWidgets import QApplication, QStyle, QStyledItemDelegate
+from PySide6.QtWidgets import QApplication, QStyle
 from ..core.analysis import DirectoryEntry, rank_files
-from .widgets import format_size
+from .widgets import CachedDelegate, format_size, number_font
+from .theme import color
 
 
 class Node:
@@ -34,7 +35,8 @@ class FileModel(QAbstractItemModel):
         self.file_icon = style.standardIcon(QStyle.StandardPixmap.SP_FileIcon)
         self.group_icon = style.standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView)
         self.folder_font = QFont()
-        self.folder_font.setBold(True)
+        self.folder_font.setWeight(QFont.Weight(660))
+        self.number_font = number_font()
 
     def set_analysis(self, analysis, mode='tree', min_size=0, query='', order='size'):
         self.beginResetModel()
@@ -130,12 +132,14 @@ class FileModel(QAbstractItemModel):
             return self.group_icon if directory and entry.state == '明细分组' else self.folder_icon if directory else self.file_icon
         if role == Qt.ItemDataRole.FontRole and column == 0 and directory:
             return self.folder_font
+        if role == Qt.ItemDataRole.FontRole and column in (1, 2, 3, 5):
+            return self.number_font
         if role == Qt.ItemDataRole.CheckStateRole and column == 0 and not directory and entry.count:
             return Qt.CheckState.Checked if entry.relative in self.checked else Qt.CheckState.Unchecked
         if role == Qt.ItemDataRole.ToolTipRole:
             return ('汇总项，展开后勾选具体文件' if directory else str(entry.record.path))
         if role == Qt.ItemDataRole.ForegroundRole and column == 3 and entry.delta:
-            return QColor('#ffbd83' if entry.delta > 0 else '#53dfbf')
+            return QColor(color(QObject.parent(self), 'positive' if entry.delta > 0 else 'accent'))
         if role == Qt.ItemDataRole.TextAlignmentRole and column in (1, 2, 3):
             return Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         if role == Qt.ItemDataRole.DisplayRole:
@@ -176,18 +180,18 @@ class FileModel(QAbstractItemModel):
         return list(self.checked.values())
 
 
-class SizeDelegate(QStyledItemDelegate):
+class SizeDelegate(CachedDelegate):
     """在大小文本下绘制占比条，不创建逐行控件或读取文件元数据。"""
-    def paint(self, painter, option, index):
-        super().paint(painter, option, index)
+    def draw(self, painter, option, index):
+        super().draw(painter, option, index)
         share = index.data(Qt.ItemDataRole.UserRole) or 0
         bar = QRectF(option.rect.left() + 12, option.rect.bottom() - 5,
                      max(0, option.rect.width() - 24), 3)
         painter.save()
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor('#2b3e50'))
+        painter.setBrush(QColor(color(self.view, 'grid')))
         painter.drawRoundedRect(bar, 1.5, 1.5)
         bar.setWidth(bar.width() * min(1, max(0, share)))
-        painter.setBrush(QColor('#53dfbf'))
+        painter.setBrush(QColor(color(self.view, 'accent')))
         painter.drawRoundedRect(bar, 1.5, 1.5)
         painter.restore()

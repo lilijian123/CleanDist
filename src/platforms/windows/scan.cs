@@ -1,6 +1,7 @@
 // 只读枚举 Win32 文件元数据，输出带帧结构的二进制流，不读取文件内容。
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -39,6 +40,12 @@ internal static class Scan {
     private static string Root;
     private static long PendingDirectories = 1, LastFlush;
     private static Exception WorkerError;
+    private static bool AppsOnly;
+    // 应用候选模式排除系统和依赖目录，不改变普通文件扫描的遍历范围。
+    private static readonly HashSet<string> AppSkip = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+        "Windows", "$Recycle.Bin", "System Volume Information", "$Windows.~BT",
+        "node_modules", ".git", ".venv", "venv", "__pycache__"
+    };
 
     private static void WriteText(BinaryWriter writer, string value) {
         byte[] bytes = Encoding.UTF8.GetBytes(value);
@@ -87,9 +94,11 @@ internal static class Scan {
                     if ((data.Attributes & SkipAttributes) != 0) { writer.Write((byte)'K'); continue; }
                     string child = relative.Length == 0 ? data.Name : relative + "/" + data.Name;
                     if ((data.Attributes & 0x10) != 0) {
+                        if (AppsOnly && AppSkip.Contains(data.Name)) continue;
                         Interlocked.Increment(ref PendingDirectories);
                         Directories.Add(child);
                     } else {
+                        if (AppsOnly && !data.Name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) continue;
                         writer.Write((byte)'F'); WriteText(writer, child);
                         writer.Write(((ulong)data.SizeHigh << 32) | data.SizeLow);
                         writer.Write(PackFileTime(data.Modified)); writer.Write(PackFileTime(data.Created));
@@ -117,7 +126,8 @@ internal static class Scan {
 
     public static int Main(string[] args) {
         try {
-            if (args.Length != 1) return 2;
+            if (args.Length < 1 || args.Length > 2 || (args.Length == 2 && args[1] != "--apps")) return 2;
+            AppsOnly = args.Length == 2;
             Root = Path.GetFullPath(args[0]).TrimEnd('\\') + "\\";
             if (!Root.StartsWith(@"\\?\")) Root = Root.StartsWith(@"\\") ? @"\\?\UNC\" + Root.Substring(2) : @"\\?\" + Root;
             Output = new BinaryWriter(new BufferedStream(Console.OpenStandardOutput(), 1048576), Encoding.UTF8);
