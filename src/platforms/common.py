@@ -27,6 +27,10 @@ def load_process_icons(keys, cancel):
     return {key: b'' for key in keys if not cancel.is_set()}
 
 
+def stop_process(key):
+    raise NotImplementedError('当前平台尚未适配普通结束进程')
+
+
 def allocated_bytes(stream):
     info = os.fstat(stream.fileno())
     if not hasattr(info, 'st_blocks'):

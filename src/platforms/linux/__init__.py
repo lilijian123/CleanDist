@@ -2,7 +2,7 @@
 from ..common import (
     DirectoryWatch, FONT_FAMILY, SCAN_NAME, is_link, list_disks, process_options,
     python_executable, recycle, scan_apps, scan_native, load_app_icons, load_process_icons,
-    allocated_bytes, open_metadata,
+    allocated_bytes, open_metadata, stop_process,
 )
 
 

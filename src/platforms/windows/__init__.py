@@ -10,6 +10,7 @@ from .disks import list_disks
 from .scan import scan_native
 from .storage import allocated_bytes, open_metadata
 from .watch import DirectoryWatch
+from .processes import stop_process
 
 
 NAME = 'Windows'

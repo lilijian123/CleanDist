@@ -11,7 +11,7 @@ from PySide6.QtGui import QColor, QCursor, QFont, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QTabWidget, QTableWidgetItem,
-    QStackedWidget, QTextEdit, QTreeView, QVBoxLayout, QWidget,
+    QScrollArea, QSplitter, QStackedWidget, QTextEdit, QTreeView, QVBoxLayout, QWidget,
 )
 from ..core.files import execute_cleanup, prepare_cleanup, scan_directory, validate_plain_path
 from ..core.analysis import analyze_files
@@ -21,7 +21,7 @@ from .. import APP_NAME
 from .dialogs import PreviewDialog
 from .apps import AppPage
 from .files import FileModel, SizeDelegate
-from .processes import ProcessIcons
+from .processes import ProcessIcons, ProcessPanel
 from .storage import StorageDialog
 from .treemap import MapPage
 from .theme import STYLE, LIGHT_STYLE, color
@@ -236,28 +236,37 @@ class MainWindow(QMainWindow):
         for card in (self.used_card, self.available_card, self.total_card, self.process_card):
             cards.addWidget(card)
         layout.addLayout(cards)
-        chart_frame = QFrame()
-        chart_frame.setObjectName('card')
-        chart_layout = QVBoxLayout(chart_frame)
-        chart_layout.setContentsMargins(16, 12, 16, 6)
-        self.trend_title = label('进程内存趋势', 'section')
-        chart_layout.addWidget(self.trend_title)
-        self.chart = TrendChart()
-        chart_layout.addWidget(self.chart)
-        layout.addWidget(chart_frame)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        listing = QWidget()
+        listing.setMinimumWidth(400)
+        list_layout = QVBoxLayout(listing)
+        list_layout.setContentsMargins(0, 0, 0, 0)
         line = QHBoxLayout()
         line.addWidget(label('进程工作集', 'section'))
         line.addStretch()
-        layout.addLayout(line)
+        list_layout.addLayout(line)
         self.memory_table = table(['进程名称', 'PID', '当前工作集 RSS', '窗口内变化', '实际观察时长'])
         self.memory_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.memory_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column, width in [(1, 90), (2, 160), (3, 155), (4, 150)]:
+        for column, width in [(1, 65), (2, 125), (3, 120), (4, 105)]:
             self.memory_table.setColumnWidth(column, width)
         self.memory_table.itemSelectionChanged.connect(self.select_process)
         self.memory_table.setIconSize(QSize(20, 20))
         self.process_icons = ProcessIcons(self.memory_table, self.run_job, self)
-        layout.addWidget(self.memory_table, 1)
+        list_layout.addWidget(self.memory_table, 1)
+        split.addWidget(listing)
+        self.process_panel = ProcessPanel(self.run_job, self.request_memory)
+        self.chart = self.process_panel.chart
+        self.trend_title = self.process_panel.title
+        details = QScrollArea()
+        details.setWidgetResizable(True)
+        details.setFrameShape(QFrame.Shape.NoFrame)
+        details.setMinimumWidth(380)
+        details.setWidget(self.process_panel)
+        split.addWidget(details)
+        split.setChildrenCollapsible(False)
+        split.setSizes([650, 520])
+        layout.addWidget(split, 1)
         self.tabs.addTab(page, '01  内存监测')
 
     def _build_files_tab(self):
@@ -523,9 +532,7 @@ class MainWindow(QMainWindow):
 
     def draw_process(self):
         process = next((process for process in self.memory_snapshot.processes if process.key == self.selected_process), None) if self.memory_snapshot else None
-        self.chart.points = process.points if process else ()
-        self.chart.update()
-        self.trend_title.setText(f'{process.name} · PID {process.key[0]} · 工作集趋势' if process else '进程内存趋势')
+        self.process_panel.set_reading(process)
 
     def choose_directory(self):
         path = QFileDialog.getExistingDirectory(self, '选择文件夹', str(self.root or Path.home()))
@@ -919,6 +926,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.closing = True
+        self.process_panel.shutdown()
         self.process_icons.shutdown()
         for dialog in self.findChildren(StorageDialog):
             dialog.close()

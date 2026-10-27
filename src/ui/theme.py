@@ -13,6 +13,7 @@ QLabel#pill { color: #a8c8b5; background: #20201e; border: 0; border-radius: 12p
 QFrame#card { background: #1a1a19; border: 0; border-radius: 13px; }
 QFrame#card QLabel { background: transparent; }
 QLabel#metric { font-size: 27px; font-weight: 660; color: #e5e5df; }
+QLabel#processMetric { font-size: 17px; font-weight: 560; color: #e5e5df; }
 QLabel#section { font-size: 16px; font-weight: 610; }
 QPushButton { background: #20201e; border: 0; border-radius: 7px; padding: 9px 16px; font-weight: 560; }
 QPushButton#settingsButton { padding: 0; }

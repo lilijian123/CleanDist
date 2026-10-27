@@ -258,7 +258,14 @@ class TrendChart(QWidget):
     def __init__(self):
         super().__init__()
         self.points = ()
+        self.relative = False
         self.setMinimumHeight(145)
+
+    def plot_points(self):
+        if self.relative and self.points:
+            baseline = self.points[0][1]
+            return tuple((stamp, value - baseline) for stamp, value in self.points)
+        return self.points
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -272,17 +279,24 @@ class TrendChart(QWidget):
             painter.setPen(QColor(color(self, 'muted')))
             painter.drawText(area, Qt.AlignmentFlag.AlignCenter, '选择进程查看趋势')
             return
-        ceiling = max(max(value for _, value in self.points) * 1.15, 1024 * 1024)
-        first, last = self.points[0][0], self.points[-1][0]
+        readings = self.plot_points()
+        floor = 0
+        ceiling = max(max(value for _, value in readings) * 1.15, 1024 * 1024)
+        if self.relative:
+            low, high = min(value for _, value in readings), max(value for _, value in readings)
+            padding = max((high - low) * .1, 1) if high != low else 1024
+            floor, ceiling = min(0, low) - padding, max(0, high) + padding
+        first, last = readings[0][0], readings[-1][0]
         span = max(last - first, 1)
         painter.setPen(QColor(color(self, 'muted')))
         for fraction in (0, 0.5, 1):
             text_rect = QRectF(0, area.top() + area.height() * fraction - 9, 76, 20)
-            painter.drawText(text_rect, Qt.AlignmentFlag.AlignRight, format_size(ceiling * (1 - fraction)))
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignRight,
+                             format_size(ceiling - (ceiling - floor) * fraction, self.relative))
         painter.drawText(QPointF(area.left(), self.height() - 8), f'{last - first:.0f}秒前')
         painter.drawText(QPointF(area.right() - 30, self.height() - 8), '现在')
         points = [QPointF(area.left() + (timestamp - first) / span * area.width(),
-                          area.bottom() - value / ceiling * area.height()) for timestamp, value in self.points]
+                          area.bottom() - (value - floor) / (ceiling - floor) * area.height()) for timestamp, value in readings]
         path = QPainterPath(points[0])
         for point in points[1:]:
             path.lineTo(point)
