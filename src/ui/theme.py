@@ -15,6 +15,7 @@ QFrame#card QLabel { background: transparent; }
 QLabel#metric { font-size: 27px; font-weight: 660; color: #e5e5df; }
 QLabel#section { font-size: 16px; font-weight: 610; }
 QPushButton { background: #20201e; border: 0; border-radius: 7px; padding: 9px 16px; font-weight: 560; }
+QPushButton#settingsButton { padding: 0; }
 QPushButton:hover { background: #272725; }
 QPushButton:pressed { background: #111110; }
 QPushButton:disabled { color: #666861; background: #1a1a19; }
@@ -27,6 +28,8 @@ QLineEdit:focus { background: #171716; }
 QLineEdit#filePath { background: transparent; color: #8b8e87; padding: 3px 8px; }
 QComboBox { background: #1a1a19; border: 0; padding: 9px; border-radius: 7px; min-width: 90px; }
 QComboBox::drop-down { border: 0; width: 23px; }
+QComboBox#themeChoice { background: #20201e; border: 1px solid #3b3d37; }
+QComboBox#themeChoice::down-arrow { width: 0; height: 0; }
 QComboBox QAbstractItemView { background: #20201e; border: 0; selection-background-color: #2b302a; }
 QMenu { background: #20201e; border: 0; padding: 6px; }
 QMenu::item { padding: 7px 20px; border-radius: 5px; }
@@ -34,6 +37,10 @@ QMenu::item:selected { background: #2b302a; }
 QTabWidget::pane { border: 0; }
 QTabBar::tab { background: transparent; color: #8b8e87; padding: 12px 24px; margin-right: 8px; border: 0; font-size: 14px; }
 QTabBar::tab:selected { color: #c6d8c8; background: #1a1a19; border-radius: 8px; }
+QListWidget#fileModes, QListWidget#settingsNav { background: #1a1a19; border: 0; border-radius: 10px; padding: 6px; }
+QListWidget#fileModes::item, QListWidget#settingsNav::item { height: 38px; padding: 4px 8px; border: 0; border-radius: 7px; }
+QListWidget#fileModes::item:hover, QListWidget#settingsNav::item:hover { background: #20201e; }
+QListWidget#fileModes::item:selected, QListWidget#settingsNav::item:selected { background: #293029; color: #c6d8c8; font-weight: 560; }
 QTableView, QTreeView { background: #151515; alternate-background-color: #1a1a19; border: 0; border-radius: 8px; selection-background-color: #293029; selection-color: #e1e8de; }
 QTableView::item, QTreeView::item { padding: 5px 10px; border: 0; }
 QTreeView::item { height: 28px; padding: 3px 10px; }

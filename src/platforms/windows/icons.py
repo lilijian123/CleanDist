@@ -1,9 +1,11 @@
 """只读提取图标资源并转换为图片数据，不启动或加载目标程序代码。"""
 import ctypes
 from ctypes import wintypes
+from functools import lru_cache
 import os
 from pathlib import Path
 import re
+import psutil
 
 
 def icon_location(value):
@@ -20,6 +22,33 @@ def load_app_icons(requests, cancel):
         if cancel.is_set():
             break
         result[(path, index)] = read_icon(path, index)
+    return result
+
+
+@lru_cache(maxsize=128)
+def process_icon(path, modified, size):
+    # 多个进程常共用一个程序；文件版本变化后自然使用新的缓存键。
+    return read_icon(path)
+
+
+def load_process_icons(keys, cancel):
+    result = {}
+    for key in keys:
+        if cancel.is_set():
+            break
+        data = b''
+        try:
+            process = psutil.Process(key[0])
+            if process.create_time() == key[1] and process.is_running():
+                path = Path(process.exe())
+                if path.is_absolute():
+                    info = path.stat()
+                    data = process_icon(path, info.st_mtime_ns, info.st_size)
+                    if not process.is_running():
+                        data = b''
+        except (psutil.Error, OSError, ValueError):
+            pass
+        result[key] = data
     return result
 
 

@@ -1,29 +1,23 @@
-"""按需加载的树形模型，文件记录保存在工作线程生成的分析数据中，无需逐个创建控件。"""
+"""按批次生成 Qt 原生树条目，滚动时复用显示值，无需逐个创建控件。"""
 from datetime import datetime
 
-from PySide6.QtCore import QAbstractItemModel, QModelIndex, QObject, QRectF, Qt
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import QEvent, QModelIndex, QRectF, Qt
+from PySide6.QtGui import QColor, QFont, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import QApplication, QStyle
 from ..core.analysis import DirectoryEntry, rank_files
 from .widgets import CachedDelegate, format_size, number_font
 from .theme import color
 
 
-class Node:
-    def __init__(self, entry=None, parent=None, row=0):
-        self.entry, self.parent, self.row = entry, parent, row
-        self.children = []
-        self.fetched = False
-
-
-class FileModel(QAbstractItemModel):
+class FileModel(QStandardItemModel):
     BATCH = 200
     HEADERS = ('名称 / 相对路径', '大小 / 占比', '文件数', '本轮增量', '状态', '修改时间')
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.analysis = None
-        self.root = Node()
+        self.root = self.invisibleRootItem()
+        self.root.fetched = True
         self.nodes = {}
         self.checked = {}
         self.flat = False
@@ -37,31 +31,64 @@ class FileModel(QAbstractItemModel):
         self.folder_font = QFont()
         self.folder_font.setWeight(QFont.Weight(660))
         self.number_font = number_font()
+        self.setHorizontalHeaderLabels(self.HEADERS)
+        self.horizontalHeaderItem(1).setToolTip('占本次已扫描文件逻辑总大小的比例，不代表实际磁盘使用率。')
+        self.itemChanged.connect(self._selection_changed)
+        if parent is not None:
+            parent.installEventFilter(self)
 
     def set_analysis(self, analysis, mode='tree', min_size=0, query='', order='size'):
-        self.beginResetModel()
+        # 移除旧行期间保持旧分析数据有效，避免 hasChildren 与尚存子行矛盾。
+        self.removeRows(0, self.rowCount())
         self.analysis = analysis
         self.total_size = analysis.directories[''].size if analysis else 0
         self.flat = mode != 'tree' or bool(query.strip())
         self.children = (analysis.growth_children if order == 'growth' else analysis.children) if analysis else {}
         self.entries = (rank_files(analysis, mode, min_size, query) if self.flat else self.children['']) if analysis else []
-        self.root = Node()
         self.nodes = {}
         files = analysis.snapshot.files if analysis else {}
         self.checked = {key: files[key] for key, old in self.checked.items()
                         if key in files and files[key].fingerprint == old.fingerprint}
+        self.root.fetched = True
         self._append_nodes(self.root, self.entries[:self.BATCH])
-        self.endResetModel()
 
     def _append_nodes(self, node, entries):
         node.fetched = True
         for entry in entries:
-            child = Node(entry, node, len(node.children))
-            node.children.append(child)
-            self.nodes[entry.relative] = child
+            directory = isinstance(entry, DirectoryEntry)
+            share = entry.size / self.total_size if self.total_size else 0
+            values = (
+                entry.relative if self.flat else entry.name,
+                f'{format_size(entry.size)}  ·  {share:.1%}',
+                f'{entry.count:,}' if directory else '—',
+                format_size(entry.delta, True) if self.analysis.comparable else '未确认',
+                entry.state,
+                datetime.fromtimestamp(entry.modified_ns / 1e9).strftime('%m-%d %H:%M:%S') if entry.modified_ns else '—',
+            )
+            items = [QStandardItem(value) for value in values]
+            first = items[0]
+            first.entry = entry
+            first.fetched = False
+            if directory:
+                first.setColumnCount(len(self.HEADERS))
+            first.setIcon(self.group_icon if directory and entry.state == '明细分组' else self.folder_icon if directory else self.file_icon)
+            items[1].setData(share, Qt.ItemDataRole.UserRole)
+            tooltip = '汇总项，展开后勾选具体文件' if directory else str(entry.record.path)
+            for column, item in enumerate(items):
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                item.setToolTip(tooltip)
+                if column in (1, 2, 3):
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            if not directory and entry.count:
+                first.setFlags(first.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                first.setData(Qt.CheckState.Checked if entry.relative in self.checked else Qt.CheckState.Unchecked,
+                              Qt.ItemDataRole.CheckStateRole)
+            self._style_row(items, entry)
+            self.nodes[entry.relative] = first
+            node.appendRow(items)
 
     def _node_from_index(self, index):
-        return index.internalPointer() if index.isValid() else self.root
+        return self.itemFromIndex(index.siblingAtColumn(0)) if index.isValid() else self.root
 
     def _child_entries(self, node):
         if node is self.root:
@@ -70,33 +97,15 @@ class FileModel(QAbstractItemModel):
             return self.children.get(node.entry.relative, [])
         return []
 
-    def index(self, row, column, parent=QModelIndex()):
-        if row < 0 or column < 0 or column >= len(self.HEADERS) or (parent.isValid() and parent.column() != 0):
-            return QModelIndex()
-        children = self._node_from_index(parent).children
-        return self.createIndex(row, column, children[row]) if row < len(children) else QModelIndex()
-
-    def parent(self, index):
-        if not index.isValid():
-            return QModelIndex()
-        node = self._node_from_index(index).parent
-        return QModelIndex() if node is self.root else self.createIndex(node.row, 0, node)
-
-    def columnCount(self, parent=QModelIndex()):
-        return len(self.HEADERS)
-
-    def rowCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() and parent.column() != 0 else len(self._node_from_index(parent).children)
-
     def hasChildren(self, parent=QModelIndex()):
         return not (parent.isValid() and parent.column() != 0) and bool(self._child_entries(self._node_from_index(parent)))
 
     def canFetchMore(self, parent=QModelIndex()):
-        return not self._node_from_index(parent).fetched and self.has_more(parent)
+        return self.has_more(parent) and not self._node_from_index(parent).fetched
 
     def has_more(self, parent=QModelIndex()):
         node = self._node_from_index(parent)
-        return not (parent.isValid() and parent.column() != 0) and len(node.children) < len(self._child_entries(node))
+        return not (parent.isValid() and parent.column() != 0) and node.rowCount() < len(self._child_entries(node))
 
     def fetchMore(self, parent=QModelIndex()):
         if not self.canFetchMore(parent):
@@ -107,74 +116,49 @@ class FileModel(QAbstractItemModel):
         if not self.has_more(parent):
             return
         node = self._node_from_index(parent)
-        start = len(node.children)
+        start = node.rowCount()
         batch = self._child_entries(node)[start:start + self.BATCH]
-        self.beginInsertRows(parent, start, start + len(batch) - 1)
         self._append_nodes(node, batch)
-        self.endInsertRows()
 
-    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
-        if section == 1 and role == Qt.ItemDataRole.ToolTipRole:
-            return '占本次已扫描文件逻辑总大小的比例，不代表实际磁盘使用率。'
-        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            return self.HEADERS[section]
+    def _style_row(self, items, entry):
+        if isinstance(entry, DirectoryEntry):
+            items[0].setFont(self.folder_font)
+        for column in (1, 2, 3, 5):
+            items[column].setFont(self.number_font)
+        if entry.delta:
+            items[3].setData(QColor(color(self.parent(), 'positive' if entry.delta > 0 else 'accent')),
+                             Qt.ItemDataRole.ForegroundRole)
 
-    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid():
-            return None
-        entry = self._node_from_index(index).entry
-        directory = isinstance(entry, DirectoryEntry)
-        column = index.column()
-        share = entry.size / self.total_size if self.total_size else 0
-        if role == Qt.ItemDataRole.UserRole and column == 1:
-            return share
-        if role == Qt.ItemDataRole.DecorationRole and column == 0:
-            return self.group_icon if directory and entry.state == '明细分组' else self.folder_icon if directory else self.file_icon
-        if role == Qt.ItemDataRole.FontRole and column == 0 and directory:
-            return self.folder_font
-        if role == Qt.ItemDataRole.FontRole and column in (1, 2, 3, 5):
-            return self.number_font
-        if role == Qt.ItemDataRole.CheckStateRole and column == 0 and not directory and entry.count:
-            return Qt.CheckState.Checked if entry.relative in self.checked else Qt.CheckState.Unchecked
-        if role == Qt.ItemDataRole.ToolTipRole:
-            return ('汇总项，展开后勾选具体文件' if directory else str(entry.record.path))
-        if role == Qt.ItemDataRole.ForegroundRole and column == 3 and entry.delta:
-            return QColor(color(QObject.parent(self), 'positive' if entry.delta > 0 else 'accent'))
-        if role == Qt.ItemDataRole.TextAlignmentRole and column in (1, 2, 3):
-            return Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        if role == Qt.ItemDataRole.DisplayRole:
-            if column == 0:
-                return entry.relative if self.flat else entry.name
-            if column == 1:
-                return f'{format_size(entry.size)}  ·  {share:.1%}'
-            if column == 2:
-                return f'{entry.count:,}' if directory else '—'
-            if column == 3:
-                return format_size(entry.delta, True) if self.analysis.comparable else '未确认'
-            if column == 4:
-                return entry.state
-            if column == 5:
-                return datetime.fromtimestamp(entry.modified_ns / 1e9).strftime('%m-%d %H:%M:%S') if entry.modified_ns else '—'
+    def set_fonts(self, font, folder_weight):
+        self.number_font = font
+        self.folder_font.setWeight(QFont.Weight(folder_weight))
+        for node in self.nodes.values():
+            parent = node.parent() or self.root
+            self._style_row([parent.child(node.row(), column) for column in range(len(self.HEADERS))], node.entry)
 
-    def flags(self, index):
-        if not index.isValid():
-            return Qt.ItemFlag.NoItemFlags
-        entry = self._node_from_index(index).entry
-        flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-        if index.column() == 0 and not isinstance(entry, DirectoryEntry) and entry.count:
-            flags |= Qt.ItemFlag.ItemIsUserCheckable
-        return flags
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.DynamicPropertyChange and bytes(event.propertyName()) == b'theme':
+            for node in self.nodes.values():
+                if node.entry.delta:
+                    parent = node.parent() or self.root
+                    parent.child(node.row(), 3).setData(
+                        QColor(color(self.parent(), 'positive' if node.entry.delta > 0 else 'accent')),
+                        Qt.ItemDataRole.ForegroundRole)
+        return super().eventFilter(watched, event)
 
     def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
         if role != Qt.ItemDataRole.CheckStateRole or not (self.flags(index) & Qt.ItemFlag.ItemIsUserCheckable):
             return False
-        entry = self._node_from_index(index).entry
-        if value in (Qt.CheckState.Checked, Qt.CheckState.Checked.value):
+        return super().setData(index, Qt.CheckState(value), role)
+
+    def _selection_changed(self, item):
+        entry = getattr(item, 'entry', None)
+        if entry is None or isinstance(entry, DirectoryEntry) or not entry.count:
+            return
+        if item.checkState() == Qt.CheckState.Checked:
             self.checked[entry.relative] = entry.record
         else:
             self.checked.pop(entry.relative, None)
-        self.dataChanged.emit(index, index, [role])
-        return True
 
     def selected_records(self):
         return list(self.checked.values())

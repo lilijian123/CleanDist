@@ -5,7 +5,7 @@ import sys
 from .. import common
 from ..common import recycle
 from .apps import scan_apps
-from .icons import load_app_icons
+from .icons import load_app_icons, load_process_icons
 from .disks import list_disks
 from .scan import scan_native
 from .storage import allocated_bytes, open_metadata

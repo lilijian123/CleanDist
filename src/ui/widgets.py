@@ -1,12 +1,12 @@
 """可复用的 Qt 控件、格式化工具与内存图表。"""
 from collections import OrderedDict
 from functools import lru_cache
-from math import ceil
+from math import ceil, cos, pi, sin
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QFrame, QLabel, QLineEdit, QPushButton, QTableWidget,
+    QAbstractItemView, QApplication, QComboBox, QFrame, QLabel, QLineEdit, QPushButton, QTableWidget,
     QStyledItemDelegate, QStyleOptionViewItem, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 from .theme import color
@@ -76,6 +76,56 @@ def button(text, callback, primary=False):
         item.setObjectName('primary')
     item.clicked.connect(callback)
     return item
+
+
+class SettingsButton(QPushButton):
+    """随主题着色的齿轮图标，无需额外图标依赖。"""
+    def __init__(self, callback):
+        super().__init__()
+        self.setObjectName('settingsButton')
+        self.setAccessibleName('设置')
+        self.setToolTip('设置')
+        self.setFixedSize(40, 40)
+        self.setIconSize(QSize(22, 22))
+        self.clicked.connect(callback)
+        self.refresh_icon()
+
+    def refresh_icon(self):
+        shape = QPainterPath()
+        for point in range(48):
+            radius = (8, 8, 10.5, 10.5, 8, 8)[point % 6]
+            angle = point * 2 * pi / 48
+            position = QPointF(12 + radius * cos(angle), 12 + radius * sin(angle))
+            shape.lineTo(position) if point else shape.moveTo(position)
+        shape.closeSubpath()
+        shape.addEllipse(QRectF(8.5, 8.5, 7, 7))
+        shape.setFillRule(Qt.FillRule.OddEvenFill)
+        icon = QIcon()
+        for size in (24, 48):
+            pixmap = QPixmap(size, size)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.scale(size / 24, size / 24)
+            painter.fillPath(shape, QColor(color(self, 'muted')))
+            painter.end()
+            icon.addPixmap(pixmap)
+        self.setIcon(icon)
+
+
+class ThemeChoice(QComboBox):
+    """明确显示下拉入口，并让箭头跟随当前主题。"""
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(color(self, 'muted')), 1.6,
+                            Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        x, y = self.width() - 15, self.height() / 2
+        path = QPainterPath(QPointF(x - 4, y - 2))
+        path.lineTo(x, y + 2)
+        path.lineTo(x + 4, y - 2)
+        painter.drawPath(path)
 
 
 def table(headers):

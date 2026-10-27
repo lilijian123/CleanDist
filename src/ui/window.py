@@ -6,11 +6,11 @@ import threading
 import time
 
 import psutil
-from PySide6.QtCore import QModelIndex, QSettings, Qt, QThreadPool, QTimer
+from PySide6.QtCore import QModelIndex, QSettings, QSize, Qt, QThreadPool, QTimer
 from PySide6.QtGui import QColor, QCursor, QFont, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
-    QMainWindow, QMessageBox, QProgressBar, QTabWidget, QTableWidgetItem,
+    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QTabWidget, QTableWidgetItem,
     QStackedWidget, QTextEdit, QTreeView, QVBoxLayout, QWidget,
 )
 from ..core.files import execute_cleanup, prepare_cleanup, scan_directory, validate_plain_path
@@ -21,10 +21,11 @@ from .. import APP_NAME
 from .dialogs import PreviewDialog
 from .apps import AppPage
 from .files import FileModel, SizeDelegate
+from .processes import ProcessIcons
 from .storage import StorageDialog
 from .treemap import MapPage
 from .theme import STYLE, LIGHT_STYLE, color
-from .widgets import BrandMark, CachedDelegate, FocusEdit, Metric, NumberItem, TrendChart, button, enable_pixel_scroll, label, format_size, number_font, table
+from .widgets import BrandMark, CachedDelegate, FocusEdit, Metric, NumberItem, SettingsButton, ThemeChoice, TrendChart, button, enable_pixel_scroll, label, format_size, number_font, table
 from .workers import Job
 
 
@@ -106,23 +107,74 @@ class MainWindow(QMainWindow):
         header.addWidget(self.brand)
         header.addWidget(label(APP_NAME, 'title'))
         header.addStretch()
-        self.theme_combo = QComboBox()
-        self.theme_combo.addItem('黑夜', 'dark')
-        self.theme_combo.addItem('白天', 'light')
-        self.theme_combo.setToolTip('选择界面主题')
-        self.theme_combo.currentIndexChanged.connect(self.apply_theme)
-        header.addWidget(self.theme_combo)
+        self.settings_button = SettingsButton(self.show_settings)
+        header.addWidget(self.settings_button)
         self.demo_button = button('体验演示', self.start_demo)
         header.addWidget(self.demo_button)
         header.addWidget(label(system.NAME, 'pill'))
         layout.addLayout(header)
+        self.pages = QStackedWidget()
+        layout.addWidget(self.pages)
         self.tabs = QTabWidget()
-        layout.addWidget(self.tabs)
+        self.pages.addWidget(self.tabs)
         self._build_memory_tab()
         self._build_files_tab()
         self.apps_page = AppPage(self.run_job)
         self.tabs.addTab(self.apps_page, '03  应用扫描')
+        self._build_settings_page()
         self.statusBar().showMessage('正在获取系统状态…')
+
+    def _build_settings_page(self):
+        self.settings_page = QWidget()
+        layout = QVBoxLayout(self.settings_page)
+        layout.setContentsMargins(0, 16, 0, 0)
+        layout.setSpacing(18)
+        header = QHBoxLayout()
+        self.settings_back = button('返回', self.close_settings)
+        header.addWidget(self.settings_back)
+        header.addWidget(label('设置', 'section'))
+        header.addStretch()
+        layout.addLayout(header)
+        body = QHBoxLayout()
+        body.setSpacing(24)
+        self.settings_nav = QListWidget()
+        self.settings_nav.setObjectName('settingsNav')
+        self.settings_nav.setFixedWidth(176)
+        self.settings_nav.addItem('外观')
+        self.settings_nav.setCurrentRow(0)
+        body.addWidget(self.settings_nav)
+        appearance = QVBoxLayout()
+        appearance.setSpacing(18)
+        appearance.addWidget(label('外观', 'title'))
+        card = QFrame()
+        card.setObjectName('card')
+        row = QHBoxLayout(card)
+        row.setContentsMargins(20, 18, 20, 18)
+        row.addWidget(label('主题'))
+        row.addStretch()
+        self.theme_combo = ThemeChoice()
+        self.theme_combo.setObjectName('themeChoice')
+        self.theme_combo.setAccessibleName('主题')
+        self.theme_combo.addItem('黑夜', 'dark')
+        self.theme_combo.addItem('白天', 'light')
+        self.theme_combo.setMinimumWidth(160)
+        self.theme_combo.currentIndexChanged.connect(self.apply_theme)
+        row.addWidget(self.theme_combo)
+        appearance.addWidget(card)
+        appearance.addStretch()
+        body.addLayout(appearance, 1)
+        layout.addLayout(body, 1)
+        self.pages.addWidget(self.settings_page)
+
+    def show_settings(self):
+        self.pages.setCurrentWidget(self.settings_page)
+        self.demo_button.hide()
+
+    def close_settings(self):
+        self.pages.setCurrentWidget(self.tabs)
+        self.demo_button.show()
+        if self.tabs.currentIndex() == 0:
+            self.render_memory()
 
     def apply_theme(self, *_):
         if not hasattr(self, 'apps_page'):
@@ -130,6 +182,7 @@ class MainWindow(QMainWindow):
         light = self.theme_combo.currentData() == 'light'
         self.setProperty('theme', 'light' if light else 'dark')
         self.brand.update()
+        self.settings_button.refresh_icon()
         self.setWindowIcon(self.brand.icon())
         self.setStyleSheet(LIGHT_STYLE if light else STYLE)
         palette = QPalette()
@@ -150,8 +203,8 @@ class MainWindow(QMainWindow):
         self.setPalette(palette)
         font = number_font(light)
         self.setFont(font)
-        self.file_model.number_font = self.apps_page.model.number_font = font
-        self.file_model.folder_font.setWeight(QFont.Weight(700 if light else 660))
+        self.apps_page.model.number_font = font
+        self.file_model.set_fonts(font, 700 if light else 660)
         for metric in self.findChildren(Metric):
             metric.value.setFont(font)
         for row in range(self.memory_table.rowCount()):
@@ -202,6 +255,8 @@ class MainWindow(QMainWindow):
         for column, width in [(1, 90), (2, 160), (3, 155), (4, 150)]:
             self.memory_table.setColumnWidth(column, width)
         self.memory_table.itemSelectionChanged.connect(self.select_process)
+        self.memory_table.setIconSize(QSize(20, 20))
+        self.process_icons = ProcessIcons(self.memory_table, self.run_job, self)
         layout.addWidget(self.memory_table, 1)
         self.tabs.addTab(page, '01  内存监测')
 
@@ -279,9 +334,15 @@ class MainWindow(QMainWindow):
         result_header.addWidget(self.duplicate_button)
         layout.addLayout(result_header)
         filters = QHBoxLayout()
-        self.file_mode = QComboBox()
+        self.file_mode = QListWidget()
+        self.file_mode.setObjectName('fileModes')
+        self.file_mode.setFixedWidth(152)
+        self.file_mode.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         for text, mode in [('目录层级', 'tree'), ('大文件', 'large'), ('最近增长', 'growth'), ('空间占用矩阵', 'map')]:
-            self.file_mode.addItem(text, mode)
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, mode)
+            self.file_mode.addItem(item)
+        self.file_mode.setCurrentRow(0)
         self.file_order = QComboBox()
         self.file_order.addItem('按占用排序', 'size')
         self.file_order.addItem('按增长排序', 'growth')
@@ -294,7 +355,7 @@ class MainWindow(QMainWindow):
         self.file_search = FocusEdit()
         self.file_search.setPlaceholderText('搜索文件名或路径，按回车')
         self.file_search.setClearButtonEnabled(True)
-        for widget in (self.file_mode, self.file_order, self.file_minimum, self.file_search):
+        for widget in (self.file_order, self.file_minimum, self.file_search):
             filters.addWidget(widget, 1 if widget is self.file_search else 0)
         layout.addLayout(filters)
         self.file_tree = QTreeView()
@@ -316,7 +377,7 @@ class MainWindow(QMainWindow):
         self.file_tree.setItemDelegateForColumn(1, SizeDelegate(self.file_tree))
         self.file_tree.selectionModel().currentChanged.connect(self.show_file_path)
         self.file_model.dataChanged.connect(self.update_selection)
-        self.file_mode.currentIndexChanged.connect(self.render_files)
+        self.file_mode.currentRowChanged.connect(self.render_files)
         self.file_order.currentIndexChanged.connect(self.render_files)
         self.file_minimum.currentIndexChanged.connect(self.render_files)
         self.file_search.returnPressed.connect(self.render_files)
@@ -335,7 +396,11 @@ class MainWindow(QMainWindow):
         self.map_page.map.file_clicked.connect(self.show_map_file)
         self.results_stack.addWidget(self.map_page)
         self.results_stack.setCurrentIndex(1)
-        layout.addWidget(self.results_stack, 1)
+        result_body = QHBoxLayout()
+        result_body.setSpacing(14)
+        result_body.addWidget(self.file_mode)
+        result_content = QVBoxLayout()
+        result_content.addWidget(self.results_stack, 1)
         details = QHBoxLayout()
         self.file_view_note = label('', 'muted')
         details.addWidget(self.file_view_note, 1)
@@ -343,7 +408,9 @@ class MainWindow(QMainWindow):
         self.more_button.setToolTip('加载当前层的下一批文件')
         self.more_button.setEnabled(False)
         details.addWidget(self.more_button)
-        layout.addLayout(details)
+        result_content.addLayout(details)
+        result_body.addLayout(result_content, 1)
+        layout.addLayout(result_body, 1)
         self.selection_note = label('未选择文件', 'muted')
         self.last_operation = label('', 'muted')
         self.last_operation.setWordWrap(True)
@@ -389,7 +456,7 @@ class MainWindow(QMainWindow):
     def accept_memory(self, snapshot):
         self.memory_snapshot = snapshot
         # 后台继续采样，隐藏页面只保存最新快照，切回时再绘制进程表。
-        if self.tabs.currentIndex() == 0:
+        if self.pages.currentWidget() is self.tabs and self.tabs.currentIndex() == 0:
             self.render_memory()
         updated_at = datetime.fromtimestamp(snapshot.timestamp).strftime('%H:%M:%S')
         self.statusBar().showMessage(f'更新 {updated_at} · {"监测中" if self.monitoring else "就绪"}')
@@ -405,6 +472,7 @@ class MainWindow(QMainWindow):
         self.available_card.value.setText(format_size(snapshot.available))
         self.total_card.value.setText(format_size(snapshot.total))
         self.process_card.value.setText(str(len(snapshot.processes)))
+        self.process_icons.refresh(process.key for process in snapshot.processes)
         # 刷新期间只重绘一次，并在重建、排序和恢复选中行后还原用户的像素位置。
         scroll_y = self.memory_table.verticalScrollBar().value()
         scroll_x = self.memory_table.horizontalScrollBar().value()
@@ -418,6 +486,7 @@ class MainWindow(QMainWindow):
             for row, process in enumerate(snapshot.processes):
                 name = QTableWidgetItem(process.name)
                 name.setData(Qt.ItemDataRole.UserRole, process.key)
+                name.setIcon(self.process_icons.icons.get(process.key, self.process_icons.default))
                 self.memory_table.setItem(row, 0, name)
                 self.memory_table.setItem(row, 1, NumberItem(str(process.key[0]), process.key[0]))
                 self.memory_table.setItem(row, 2, NumberItem(format_size(process.rss), process.rss))
@@ -529,7 +598,7 @@ class MainWindow(QMainWindow):
         filters = (self.file_mode, self.file_order, self.file_minimum, self.file_search)
         for widget in filters:
             widget.blockSignals(True)
-        self.file_mode.setCurrentIndex(0)
+        self.file_mode.setCurrentRow(0)
         self.file_order.setCurrentIndex(0)
         self.file_minimum.setCurrentIndex(2)
         self.file_search.clear()
@@ -643,7 +712,7 @@ class MainWindow(QMainWindow):
         snapshot = result.snapshot
         if self.current_snapshot is None and self.scan_kind == 'disk':
             self.file_mode.blockSignals(True)
-            self.file_mode.setCurrentIndex(self.file_mode.findData('map'))
+            self.file_mode.setCurrentRow(3)
             self.file_mode.blockSignals(False)
         self.file_analysis = result
         self.file_changes = result.changes
@@ -667,7 +736,7 @@ class MainWindow(QMainWindow):
         self.update_selection()
 
     def render_files(self, *_):
-        mode = self.file_mode.currentData()
+        mode = self.file_mode.currentItem().data(Qt.ItemDataRole.UserRole)
         is_map = mode == 'map'
         self.file_search.setEnabled(not is_map)
         self.file_minimum.setEnabled(mode == 'large')
@@ -678,9 +747,9 @@ class MainWindow(QMainWindow):
         scroll = self.file_tree.verticalScrollBar().value() if preserve else 0
         expanded = []
         for key, node in self.file_model.nodes.items():
-            index = self.file_model.createIndex(node.row, 0, node)
+            index = node.index()
             if preserve and self.file_tree.isExpanded(index):
-                expanded.append((key, len(node.children)))
+                expanded.append((key, node.rowCount()))
         root_rows = self.file_model.rowCount() if preserve else 0
         self.file_model.set_analysis(self.file_analysis, 'tree' if is_map else mode, self.file_minimum.currentData(),
                                      '' if is_map else self.file_search.text(), self.file_order.currentData())
@@ -689,8 +758,8 @@ class MainWindow(QMainWindow):
         for key, count in sorted(expanded, key=lambda item: item[0].count('/')):
             node = self.file_model.nodes.get(key)
             if node:
-                index = self.file_model.createIndex(node.row, 0, node)
-                while len(node.children) < count and self.file_model.has_more(index):
+                index = node.index()
+                while node.rowCount() < count and self.file_model.has_more(index):
                     self.file_model.load_more(index)
                 self.file_tree.expand(index)
         self.file_view_key = view_key
@@ -732,7 +801,7 @@ class MainWindow(QMainWindow):
 
     def show_file_path(self, index, *_):
         if index.isValid():
-            entry = index.internalPointer().entry
+            entry = self.file_model.itemFromIndex(index.siblingAtColumn(0)).entry
             relative = entry.relative
             if relative.startswith('\0small/'):
                 relative = relative[len('\0small/'):]
@@ -850,6 +919,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.closing = True
+        self.process_icons.shutdown()
         for dialog in self.findChildren(StorageDialog):
             dialog.close()
         self.apps_page.shutdown()
