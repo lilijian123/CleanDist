@@ -16,8 +16,6 @@ class FileModel(QStandardItemModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.analysis = None
-        self.root = self.invisibleRootItem()
-        self.root.fetched = True
         self.nodes = {}
         self.checked = {}
         self.flat = False
@@ -36,6 +34,14 @@ class FileModel(QStandardItemModel):
         self.itemChanged.connect(self._selection_changed)
         if parent is not None:
             parent.installEventFilter(self)
+
+    @property
+    def root(self):
+        # This C++-owned root has no Python destruction hook. Keeping its borrowed
+        # wrapper after model deletion can alias a new Qt object at the same address.
+        root = self.invisibleRootItem()
+        root.fetched = True
+        return root
 
     def set_analysis(self, analysis, mode='tree', min_size=0, query='', order='size'):
         # 移除旧行期间保持旧分析数据有效，避免 hasChildren 与尚存子行矛盾。

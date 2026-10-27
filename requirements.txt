@@ -1,4 +1,7 @@
 psutil==7.2.2
-PySide6-Essentials==6.12.0
-shiboken6==6.12.0
+PySide6-Essentials==6.12.0; sys_platform != 'linux'
+shiboken6==6.12.0; sys_platform != 'linux'
+# 6.12 Linux void bindings consume None references on Python 3.10/3.11.
+PySide6-Essentials==6.11.2; sys_platform == 'linux'
+shiboken6==6.11.2; sys_platform == 'linux'
 Send2Trash==2.1.0

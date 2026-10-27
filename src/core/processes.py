@@ -63,6 +63,7 @@ def matching_process(key):
 
 
 def sample_process_details(key):
+    from ..platforms import system
     process = matching_process(key)
     errors = []
 
@@ -79,8 +80,9 @@ def sample_process_details(key):
         parent_pid = read('父进程', process.ppid)
         status = read('状态', process.status)
         threads = read('线程', process.num_threads)
-        handles = read('句柄', process.num_handles) if hasattr(process, 'num_handles') else None
+        handles = read(system.PROCESS_COUNTER_LABEL, lambda: system.process_counter(process))
         memory = read('内存', process.memory_info)
+        private = read(system.PRIVATE_MEMORY_LABEL, lambda: system.private_memory(process, memory))
         cpu = read('CPU', process.cpu_times)
     parent_name = None
     if parent_pid:
@@ -94,7 +96,7 @@ def sample_process_details(key):
         raise ValueError('进程已退出或 PID 已被复用，请重新选择')
     return ProcessDetails(key, name or f'PID {key[0]}', path, parent_pid, parent_name, status,
                           threads, handles, memory.rss if memory is not None else None,
-                          getattr(memory, 'private', None),
+                          private,
                           cpu.user + cpu.system if cpu is not None else None,
                           time.monotonic(), tuple(errors))
 

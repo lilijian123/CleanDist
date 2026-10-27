@@ -38,7 +38,7 @@ class ProcessPanel(QWidget):
         self.fields = {}
         for row, (key, caption) in enumerate((('pid', 'PID'), ('path', '程序路径'), ('started', '启动时间'),
                 ('parent', '父进程'), ('status', '运行状态'), ('cpu', 'CPU（整机）'),
-                ('threads', '线程 / 句柄'), ('private', '私有提交'))):
+                ('threads', system.PROCESS_COUNTER_LABEL), ('private', system.PRIVATE_MEMORY_LABEL))):
             information.addWidget(label(caption, 'muted'), row, 0)
             value = label('不可用')
             value.setWordWrap(True)
@@ -47,7 +47,7 @@ class ProcessPanel(QWidget):
             information.addWidget(value, row, 1)
         information.setColumnStretch(1, 1)
         self.fields['cpu'].setToolTip('两次CPU时间差除以观察时长和逻辑处理器数；首次采样不可用。')
-        self.fields['private'].setToolTip('Windows私有提交量，包含可能换出的内容，不等同于物理工作集RSS。')
+        self.fields['private'].setToolTip(system.PRIVATE_MEMORY_NOTE)
         layout.addLayout(information)
         metrics = QFrame()
         metrics.setObjectName('card')
@@ -145,7 +145,7 @@ class ProcessPanel(QWidget):
             self.note.setText(('部分信息不可读取。' if details.errors else '') +
                               '统计限于观察窗口，工作集变化不能直接判定内存泄漏。')
             self.note.setToolTip('\n'.join(details.errors))
-            self.stop_button.setEnabled(not self.stopping and key[0] not in (0, 4, os.getpid()))
+            self.stop_button.setEnabled(not self.stopping and key[0] not in (*system.PROTECTED_PIDS, os.getpid()))
 
         def failed(error):
             if not self.closed and self.key == key:
@@ -166,7 +166,7 @@ class ProcessPanel(QWidget):
         key, name, path = self.key, self.title.text(), self.details.path or '路径不可用'
         answer = QMessageBox.question(self, '结束进程',
             f'是否结束 {name}（PID {key[0]}）？\n{path}\n\n未保存的数据可能丢失。'
-            '\n只发送普通结束请求，不结束子进程。',
+            f'\n{system.STOP_EXPLANATION}',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel)
         if answer != QMessageBox.StandardButton.Yes or self.closed:
             return

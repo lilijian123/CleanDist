@@ -4,6 +4,9 @@ import sys
 
 from .. import common
 from ..common import recycle
+from ..common import (APP_SOURCES, APP_PUBLISHER_LABEL, PROCESS_COUNTER_LABEL, PRIVATE_MEMORY_LABEL,
+                      PRIVATE_MEMORY_NOTE, PROTECTED_PIDS, STOP_EXPLANATION,
+                      process_counter, private_memory)
 from .apps import scan_apps
 from .icons import load_app_icons, load_process_icons
 from .disks import list_disks
@@ -14,6 +17,7 @@ from .processes import stop_process
 
 
 NAME = 'Windows'
+HAS_DISK_SCAN = True
 FONT_FAMILY = 'Microsoft YaHei UI'
 SCAN_NAME = '原生并行扫描'
 

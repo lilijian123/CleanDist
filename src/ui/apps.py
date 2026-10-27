@@ -1,11 +1,11 @@
-"""应用扫描页：只读展示三类来源，不提供启动、卸载或删除操作。"""
+"""应用扫描页：按平台提供来源与筛选，不提供启动、卸载或删除操作。"""
 import threading
 import time
 
 from PySide6.QtCore import QAbstractTableModel, QEvent, QModelIndex, QSize, Qt, QTimer
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QHBoxLayout, QLabel,
+    QAbstractItemView, QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel,
     QMenu, QStackedWidget, QStyle, QTableView, QVBoxLayout, QWidget,
 )
 
@@ -52,7 +52,7 @@ class AppModel(QAbstractTableModel):
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
-            return self.HEADERS[section]
+            return system.APP_PUBLISHER_LABEL if section == 3 else self.HEADERS[section]
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
@@ -109,7 +109,17 @@ class AppPage(QWidget):
             action.triggered.connect(self.update_drives)
             self.drive_actions.append(action)
         self.drive_button.setMenu(menu)
+        self.drive_button.setVisible(system.HAS_DISK_SCAN)
         controls.addWidget(self.drive_button)
+        self.portable_root = None
+        self.portable_button = button('选择应用目录（可选）', lambda: None)
+        self.portable_button.setVisible(not system.HAS_DISK_SCAN)
+        portable_menu = QMenu(self.portable_button)
+        portable_menu.addAction('选择应用目录…', self.choose_portable_root)
+        portable_menu.addAction('恢复全部登记应用', lambda: self.set_portable_root(None))
+        self.portable_button.setMenu(portable_menu)
+        self.set_portable_root(None)
+        controls.addWidget(self.portable_button)
         self.scan_button = button('开始扫描', self.start_scan, True)
         self.stop_button = button('停止', self.stop_scan)
         self.stop_button.setEnabled(False)
@@ -118,7 +128,7 @@ class AppPage(QWidget):
         controls.addStretch()
         layout.addLayout(controls)
         cards = QHBoxLayout()
-        self.cards = {source: Metric(source) for source in ('桌面应用', '商店应用', '便携候选', '未定位')}
+        self.cards = {source: Metric(source) for source in (*system.APP_SOURCES, '未定位')}
         for card in self.cards.values():
             cards.addWidget(card)
         layout.addLayout(cards)
@@ -127,10 +137,10 @@ class AppPage(QWidget):
         filters = QHBoxLayout()
         self.source = QComboBox()
         self.source.addItem('全部类型', '')
-        for source in ('桌面应用', '商店应用', '便携候选'):
+        for source in system.APP_SOURCES:
             self.source.addItem(source, source)
         self.search = FocusEdit()
-        self.search.setPlaceholderText('搜索名称、发布者或位置')
+        self.search.setPlaceholderText(f'搜索名称、{system.APP_PUBLISHER_LABEL}或位置')
         self.search.setClearButtonEnabled(True)
         filters.addWidget(self.source)
         filters.addWidget(self.search, 1)
@@ -138,6 +148,7 @@ class AppPage(QWidget):
         self.model = AppModel(self)
         self.table = QTableView()
         self.table.setModel(self.model)
+        self.table.setColumnHidden(4, not system.HAS_DISK_SCAN)
         self.table.setItemDelegate(CachedDelegate(self.table))
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
@@ -226,16 +237,29 @@ class AppPage(QWidget):
         all_selected = bool(selected) and len(selected) == len(self.drive_actions)
         self.all_action.setChecked(all_selected)
         self.drive_button.setText('全部盘符' if all_selected else '、'.join(selected) or '选择盘符')
-        self.scan_button.setEnabled(bool(selected) and not self.busy)
+        self.scan_button.setEnabled((bool(selected) or not system.HAS_DISK_SCAN) and not self.busy)
 
     def selected_roots(self):
+        if not system.HAS_DISK_SCAN:
+            return (self.portable_root,) if self.portable_root else None
         if self.all_action.isChecked():
             return None
         from pathlib import Path
         return tuple(Path(action.data()) for action in self.drive_actions if action.isChecked())
 
+    def choose_portable_root(self):
+        directory = QFileDialog.getExistingDirectory(self, '选择应用目录（读取 .desktop 登记，不执行程序）')
+        if directory:
+            from pathlib import Path
+            self.set_portable_root(Path(directory))
+
+    def set_portable_root(self, root):
+        self.portable_root = root
+        self.portable_button.setText(f'应用目录：{root.name}' if root else '选择应用目录（可选）')
+        self.portable_button.setToolTip(str(root) if root else '默认读取全部登记应用；指定目录时筛选该目录并读取其中的 .desktop 便携候选。')
+
     def start_scan(self):
-        if self.busy or not any(action.isChecked() for action in self.drive_actions):
+        if self.busy or (system.HAS_DISK_SCAN and not any(action.isChecked() for action in self.drive_actions)):
             return
         roots = self.selected_roots()
         self.icon_cancel.set()
@@ -256,6 +280,7 @@ class AppPage(QWidget):
         self.status.setToolTip('')
         self.scan_button.setEnabled(False)
         self.drive_button.setEnabled(False)
+        self.portable_button.setEnabled(False)
         self.stop_button.setEnabled(True)
 
         def report(value):
@@ -269,6 +294,7 @@ class AppPage(QWidget):
         def finished():
             self.busy = False
             self.drive_button.setEnabled(True)
+            self.portable_button.setEnabled(True)
             self.stop_button.setEnabled(False)
             self.update_drives()
             self.queue_icons()

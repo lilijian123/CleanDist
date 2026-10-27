@@ -277,7 +277,9 @@ class MainWindow(QMainWindow):
         controls = QHBoxLayout()
         self.scan_mode = QComboBox()
         self.scan_mode.addItem('文件夹扫描', 'folder')
-        self.scan_mode.addItem('磁盘扫描', 'disk')
+        if system.HAS_DISK_SCAN:
+            self.scan_mode.addItem('磁盘扫描', 'disk')
+        self.scan_mode.setVisible(system.HAS_DISK_SCAN)
         controls.addWidget(self.scan_mode)
         self.target_inputs = QStackedWidget()
         folder_controls = QWidget()
@@ -578,7 +580,8 @@ class MainWindow(QMainWindow):
             if not root.is_dir():
                 raise ValueError('请选择目录')
             if kind == 'folder' and root.parent == root:
-                raise ValueError('整盘扫描请使用“磁盘扫描”，并选择对应盘符。')
+                raise ValueError('整盘扫描请使用“磁盘扫描”，并选择对应盘符。' if system.HAS_DISK_SCAN
+                                 else '请选择具体文件夹，例如 /home；不支持扫描整个根文件系统。')
             if kind == 'disk' and root.parent != root:
                 raise ValueError('请选择磁盘根目录')
         except (OSError, ValueError) as error:

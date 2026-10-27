@@ -1,4 +1,5 @@
 .venv/
+.venv-linux/
 docs/
 tests/
 test/

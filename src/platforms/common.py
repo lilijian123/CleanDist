@@ -9,6 +9,22 @@ from types import SimpleNamespace
 NAME = '兼容模式'
 FONT_FAMILY = 'sans-serif'
 SCAN_NAME = '兼容扫描'
+HAS_DISK_SCAN = False
+APP_SOURCES = ('桌面应用', '商店应用', '便携候选')
+APP_PUBLISHER_LABEL = '发布者'
+PROCESS_COUNTER_LABEL = '线程 / 句柄'
+PRIVATE_MEMORY_LABEL = '私有提交'
+PRIVATE_MEMORY_NOTE = 'Windows私有提交量，包含可能换出的内容，不等同于物理工作集RSS。'
+PROTECTED_PIDS = (0, 4)
+STOP_EXPLANATION = '只发送普通结束请求，不结束子进程。'
+
+
+def process_counter(process):
+    return process.num_handles() if hasattr(process, 'num_handles') else None
+
+
+def private_memory(process, memory):
+    return getattr(memory, 'private', None)
 
 
 def list_disks():
