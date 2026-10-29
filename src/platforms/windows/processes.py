@@ -1,4 +1,4 @@
-"""以普通 taskkill /PID 请求关闭进程，保持句柄直至命令结束以阻止PID复用。"""
+"""按用户选择普通或强制结束单个进程，持有句柄以阻止PID复用。"""
 from contextlib import contextmanager
 import ctypes
 from ctypes import wintypes
@@ -49,17 +49,20 @@ def guard_process(key):
         _close(handle)
 
 
-def stop_process(key):
+def stop_process(key, *, force=False):
     with guard_process(key) as handle:
         command = [str(Path(os.environ['SystemRoot']) / 'System32' / 'taskkill.exe'), '/PID', str(key[0])]
+        if force:
+            command.append('/F')
+        mode = '强制结束' if force else '普通结束'
         try:
             result = subprocess.run(command, capture_output=True, timeout=12,
                                     creationflags=subprocess.CREATE_NO_WINDOW)
         except subprocess.TimeoutExpired as error:
-            raise TimeoutError('结束请求超时，进程状态尚未确认，请刷新；未使用强制结束') from error
+            raise TimeoutError(f'{mode}请求超时，进程状态尚未确认，请刷新') from error
         output = (result.stderr or result.stdout).decode(f'cp{_kernel.GetOEMCP()}', errors='replace').strip()
         if result.returncode:
-            raise OSError(f'普通结束未成功：{output or result.returncode}；未使用强制结束')
+            raise OSError(f'{mode}未成功：{output or result.returncode}')
         exited = _wait(handle, 1500) == 0
-        message = '进程已结束' if exited else '已发送普通结束请求，进程尚未退出，请查看该程序的提示'
+        message = '进程已结束' if exited else f'已发送{mode}请求，进程尚未退出，请刷新查看状态'
         return StopResult(key, exited, message)

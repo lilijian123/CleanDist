@@ -1,9 +1,10 @@
 """Windows 适配入口，集中处理原生扫描、通知与进程启动差异。"""
 import subprocess
 import sys
+from types import SimpleNamespace
 
 from .. import common
-from ..common import recycle
+from ..common import recycle, FileTrace, process_created
 from ..common import (APP_SOURCES, APP_PUBLISHER_LABEL, PROCESS_COUNTER_LABEL, PRIVATE_MEMORY_LABEL,
                       PRIVATE_MEMORY_NOTE, PROTECTED_PIDS, STOP_EXPLANATION,
                       process_counter, private_memory)
@@ -14,12 +15,20 @@ from .scan import scan_native
 from .storage import allocated_bytes, open_metadata
 from .watch import DirectoryWatch
 from .processes import stop_process
+from .analysis import sample_memory_breakdown, thread_identity
 
 
 NAME = 'Windows'
+CAN_FORCE_STOP = True
 HAS_DISK_SCAN = True
 FONT_FAMILY = 'Microsoft YaHei UI'
 SCAN_NAME = '原生并行扫描'
+
+
+def context_counters(process):
+    # psutil 的 Windows 后端仅提供主动切换计数，另一项的0是占位值。
+    info = process.num_ctx_switches()
+    return SimpleNamespace(voluntary=info.voluntary, involuntary=None)
 
 
 def is_link(info):

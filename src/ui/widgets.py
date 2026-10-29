@@ -1,7 +1,7 @@
 """可复用的 Qt 控件、格式化工具与内存图表。"""
 from collections import OrderedDict
 from functools import lru_cache
-from math import ceil, cos, pi, sin
+from math import ceil, cos, isfinite, pi, sin
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
@@ -259,13 +259,33 @@ class TrendChart(QWidget):
         super().__init__()
         self.points = ()
         self.relative = False
+        self.minimum_ceiling = 1024 * 1024
+        self.label_formatter = format_size
+        self.empty_text = '选择进程查看趋势'
         self.setMinimumHeight(145)
 
     def plot_points(self):
         if self.relative and self.points:
-            baseline = self.points[0][1]
-            return tuple((stamp, value - baseline) for stamp, value in self.points)
+            baseline = next((value for _, value in self.points if value is not None), 0)
+            return tuple((stamp, value - baseline if value is not None else None)
+                         for stamp, value in self.points)
         return self.points
+
+    def plot_segments(self):
+        segments, current = [], []
+        for stamp, value in self.plot_points():
+            if value is None or not isfinite(value):
+                if current:
+                    segments.append(tuple(current))
+                    current = []
+            else:
+                current.append((stamp, value))
+        if current:
+            segments.append(tuple(current))
+        return tuple(segments)
+
+    def time_range(self):
+        return (self.points[0][0], self.points[-1][0]) if self.points else (0, 0)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -275,43 +295,46 @@ class TrendChart(QWidget):
         for fraction in (0, 0.5, 1):
             y = area.top() + area.height() * fraction
             painter.drawLine(QPointF(area.left(), y), QPointF(area.right(), y))
-        if not self.points:
+        segments = self.plot_segments()
+        if not segments:
             painter.setPen(QColor(color(self, 'muted')))
-            painter.drawText(area, Qt.AlignmentFlag.AlignCenter, '选择进程查看趋势')
+            painter.drawText(area, Qt.AlignmentFlag.AlignCenter, self.empty_text)
             return
-        readings = self.plot_points()
+        readings = tuple(point for segment in segments for point in segment)
         floor = 0
-        ceiling = max(max(value for _, value in readings) * 1.15, 1024 * 1024)
+        ceiling = max(max(value for _, value in readings) * 1.15, self.minimum_ceiling)
         if self.relative:
             low, high = min(value for _, value in readings), max(value for _, value in readings)
-            padding = max((high - low) * .1, 1) if high != low else 1024
+            padding = max((high - low) * .1, 1) if high != low else max(1, self.minimum_ceiling / 1024)
             floor, ceiling = min(0, low) - padding, max(0, high) + padding
-        first, last = readings[0][0], readings[-1][0]
+        first, last = self.time_range()
         span = max(last - first, 1)
         painter.setPen(QColor(color(self, 'muted')))
         for fraction in (0, 0.5, 1):
             text_rect = QRectF(0, area.top() + area.height() * fraction - 9, 76, 20)
             painter.drawText(text_rect, Qt.AlignmentFlag.AlignRight,
-                             format_size(ceiling - (ceiling - floor) * fraction, self.relative))
+                             self.label_formatter(ceiling - (ceiling - floor) * fraction, self.relative))
         painter.drawText(QPointF(area.left(), self.height() - 8), f'{last - first:.0f}秒前')
         painter.drawText(QPointF(area.right() - 30, self.height() - 8), '现在')
-        points = [QPointF(area.left() + (timestamp - first) / span * area.width(),
-                          area.bottom() - (value - floor) / (ceiling - floor) * area.height()) for timestamp, value in readings]
-        path = QPainterPath(points[0])
-        for point in points[1:]:
-            path.lineTo(point)
-        fill = QPainterPath(path)
-        fill.lineTo(QPointF(points[-1].x(), area.bottom()))
-        fill.lineTo(QPointF(points[0].x(), area.bottom()))
-        fill.closeSubpath()
         gradient = QLinearGradient(area.topLeft(), area.bottomLeft())
         shade = QColor(color(self, 'accent'))
         shade.setAlpha(45)
         gradient.setColorAt(0, shade)
         shade.setAlpha(2)
         gradient.setColorAt(1, shade)
-        painter.fillPath(fill, gradient)
-        painter.setPen(QPen(QColor(color(self, 'accent')), 2))
-        painter.drawPath(path)
-        painter.setBrush(QColor(color(self, 'accent')))
-        painter.drawEllipse(points[-1], 3, 3)
+        for segment in segments:
+            points = [QPointF(area.left() + (timestamp - first) / span * area.width(),
+                              area.bottom() - (value - floor) / (ceiling - floor) * area.height())
+                      for timestamp, value in segment]
+            path = QPainterPath(points[0])
+            for point in points[1:]:
+                path.lineTo(point)
+            fill = QPainterPath(path)
+            fill.lineTo(QPointF(points[-1].x(), area.bottom()))
+            fill.lineTo(QPointF(points[0].x(), area.bottom()))
+            fill.closeSubpath()
+            painter.fillPath(fill, gradient)
+            painter.setPen(QPen(QColor(color(self, 'accent')), 2))
+            painter.drawPath(path)
+            painter.setBrush(QColor(color(self, 'accent')))
+            painter.drawEllipse(points[-1], 3, 3)

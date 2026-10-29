@@ -10,7 +10,7 @@ from PySide6.QtCore import QModelIndex, QSettings, QSize, Qt, QThreadPool, QTime
 from PySide6.QtGui import QColor, QCursor, QFont, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
-    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QTabWidget, QTableWidgetItem,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar, QTabWidget, QTableWidgetItem,
     QScrollArea, QSplitter, QStackedWidget, QTextEdit, QTreeView, QVBoxLayout, QWidget,
 )
 from ..core.files import execute_cleanup, prepare_cleanup, scan_directory, validate_plain_path
@@ -155,8 +155,8 @@ class MainWindow(QMainWindow):
         self.theme_combo = ThemeChoice()
         self.theme_combo.setObjectName('themeChoice')
         self.theme_combo.setAccessibleName('主题')
-        self.theme_combo.addItem('黑夜', 'dark')
-        self.theme_combo.addItem('白天', 'light')
+        self.theme_combo.addItem('深色', 'dark')
+        self.theme_combo.addItem('浅色', 'light')
         self.theme_combo.setMinimumWidth(160)
         self.theme_combo.currentIndexChanged.connect(self.apply_theme)
         row.addWidget(self.theme_combo)
@@ -251,6 +251,8 @@ class MainWindow(QMainWindow):
         for column, width in [(1, 65), (2, 125), (3, 120), (4, 105)]:
             self.memory_table.setColumnWidth(column, width)
         self.memory_table.itemSelectionChanged.connect(self.select_process)
+        self.memory_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.memory_table.customContextMenuRequested.connect(self.process_menu)
         self.memory_table.setIconSize(QSize(20, 20))
         self.process_icons = ProcessIcons(self.memory_table, self.run_job, self)
         list_layout.addWidget(self.memory_table, 1)
@@ -531,6 +533,25 @@ class MainWindow(QMainWindow):
         if selected:
             self.selected_process = self.memory_table.item(selected[0].row(), 0).data(Qt.ItemDataRole.UserRole)
             self.draw_process()
+
+    def process_menu(self, position):
+        row = self.memory_table.rowAt(position.y())
+        if row < 0:
+            return
+        self.memory_table.selectRow(row)
+        panel = self.process_panel
+        key = panel.key
+        menu = QMenu(self.memory_table)
+        ordinary = menu.addAction('结束进程')
+        ordinary.setEnabled(panel.stop_button.isEnabled())
+        force = None
+        if getattr(system, 'CAN_FORCE_STOP', False):
+            force = menu.addAction('强制结束')
+            force.setEnabled(panel.force_button.isEnabled())
+        chosen = menu.exec(self.memory_table.viewport().mapToGlobal(position))
+        # 菜单打开时仍在刷新列表；所选身份改变后不能结束另一个进程。
+        if chosen is not None and panel.key == key:
+            panel.stop_selected(force=chosen == force)
 
     def draw_process(self):
         process = next((process for process in self.memory_snapshot.processes if process.key == self.selected_process), None) if self.memory_snapshot else None
@@ -921,7 +942,7 @@ class MainWindow(QMainWindow):
         from ..demo.workload import create_demo_directory, launch_demo
         root = create_demo_directory()
         self.demo_process = launch_demo(root)
-        self.selected_process = (self.demo_process.pid, psutil.Process(self.demo_process.pid).create_time())
+        self.selected_process = (self.demo_process.pid, system.process_created(psutil.Process(self.demo_process.pid)))
         self.demo_button.setText('停止演示')
         self.start_directory(root)
         self.tabs.setCurrentIndex(1)

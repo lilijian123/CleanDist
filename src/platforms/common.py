@@ -4,6 +4,7 @@ import os
 import stat
 import sys
 from types import SimpleNamespace
+from ..core.process_trace import FileTrace
 
 
 NAME = '兼容模式'
@@ -25,6 +26,22 @@ def process_counter(process):
 
 def private_memory(process, memory):
     return getattr(memory, 'private', None)
+
+
+def sample_memory_breakdown(process):
+    return {'errors': ('当前平台未提供详细内存构成',)}
+
+
+def thread_identity(process, tid):
+    return None
+
+
+def context_counters(process):
+    return process.num_ctx_switches()
+
+
+def process_created(process):
+    return process.create_time()
 
 
 def list_disks():

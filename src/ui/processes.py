@@ -5,11 +5,12 @@ import os
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer
 from PySide6.QtGui import QIcon, QPixmap
-from PySide6.QtWidgets import QComboBox, QFrame, QGridLayout, QHBoxLayout, QMessageBox, QStyle, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QComboBox, QFrame, QGridLayout, QHBoxLayout, QMessageBox, QStyle, QTabWidget, QVBoxLayout, QWidget
 
 from ..platforms import system
 from ..core.processes import cpu_percentage, sample_process_details, summarize_memory
 from .widgets import TrendChart, button, format_size, label
+from .process_analysis import AnalysisPane
 
 
 class ProcessPanel(QWidget):
@@ -32,7 +33,22 @@ class ProcessPanel(QWidget):
         self.stop_button.setObjectName('danger')
         self.stop_button.setEnabled(False)
         header.addWidget(self.stop_button)
+        self.force_button = button('强制结束', lambda: self.stop_selected(force=True))
+        self.force_button.setObjectName('danger')
+        self.force_button.setVisible(getattr(system, 'CAN_FORCE_STOP', False))
+        self.force_button.setEnabled(False)
+        header.addWidget(self.force_button)
         layout.addLayout(header)
+        self.operation = label('', 'muted')
+        self.operation.setWordWrap(True)
+        layout.addWidget(self.operation)
+        self.details_tabs = QTabWidget()
+        layout.addWidget(self.details_tabs)
+        overview = QWidget()
+        self.details_tabs.addTab(overview, '概览')
+        layout = QVBoxLayout(overview)
+        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setSpacing(12)
         information = QGridLayout()
         information.setHorizontalSpacing(16)
         self.fields = {}
@@ -80,22 +96,28 @@ class ProcessPanel(QWidget):
         self.note = label('统计限于观察窗口，工作集变化不能直接判定内存泄漏。', 'muted')
         self.note.setWordWrap(True)
         layout.addWidget(self.note)
-        self.operation = label('', 'muted')
-        self.operation.setWordWrap(True)
-        layout.addWidget(self.operation)
         layout.addStretch()
+        self.analysis = AnalysisPane(run_job)
+        self.details_tabs.addTab(self.analysis, '资源分析')
 
     def change_chart(self, *_):
         self.chart.relative = bool(self.chart_mode.currentData())
         self.chart.update()
 
+    def update_stop_buttons(self):
+        enabled = bool(self.key and not self.closed and not self.stopping and
+                       self.key[0] not in (*system.PROTECTED_PIDS, os.getpid()))
+        self.stop_button.setEnabled(enabled)
+        self.force_button.setEnabled(enabled and getattr(system, 'CAN_FORCE_STOP', False))
+
     def set_reading(self, reading):
         if self.closed:
             return
         key = reading.key if reading else None
+        self.analysis.set_key(key)
         if key != self.key:
             self.key, self.details = key, None
-            self.stop_button.setEnabled(False)
+            self.update_stop_buttons()
             self.operation.clear()
             for field in self.fields.values():
                 field.setText('不可用')
@@ -133,6 +155,8 @@ class ProcessPanel(QWidget):
             percent = cpu_percentage(self.details, details)
             self.details = details
             self.fields['path'].setText(details.path or '不可用')
+            if details.started_at is not None:
+                self.fields['started'].setText(datetime.fromtimestamp(details.started_at).strftime('%Y-%m-%d %H:%M:%S'))
             parent = str(details.parent_pid) if details.parent_pid is not None else '不可用'
             self.fields['parent'].setText(f'{details.parent_name} · PID {parent}' if details.parent_name else parent)
             self.fields['status'].setText({'running': '运行中', 'sleeping': '等待中', 'stopped': '已停止',
@@ -145,12 +169,12 @@ class ProcessPanel(QWidget):
             self.note.setText(('部分信息不可读取。' if details.errors else '') +
                               '统计限于观察窗口，工作集变化不能直接判定内存泄漏。')
             self.note.setToolTip('\n'.join(details.errors))
-            self.stop_button.setEnabled(not self.stopping and key[0] not in (*system.PROTECTED_PIDS, os.getpid()))
+            self.update_stop_buttons()
 
         def failed(error):
             if not self.closed and self.key == key:
                 self.details = None
-                self.stop_button.setEnabled(False)
+                self.update_stop_buttons()
                 self.note.setText(f'详情暂不可用：{error}')
 
         def finished():
@@ -160,20 +184,26 @@ class ProcessPanel(QWidget):
 
         self.run_job(lambda: sample_process_details(key), accept, failed, finished)
 
-    def stop_selected(self):
-        if self.closed or self.stopping or not self.details or self.details.key != self.key:
+    def stop_selected(self, *, force=False):
+        if self.closed or self.stopping or not self.key or not self.stop_button.isEnabled():
             return
-        key, name, path = self.key, self.title.text(), self.details.path or '路径不可用'
-        answer = QMessageBox.question(self, '结束进程',
-            f'是否结束 {name}（PID {key[0]}）？\n{path}\n\n未保存的数据可能丢失。'
-            f'\n{system.STOP_EXPLANATION}',
+        if force and not getattr(system, 'CAN_FORCE_STOP', False):
+            return
+        key, name = self.key, self.title.text()
+        path = (self.details.path if self.details and self.details.key == key else None) or '路径不可用'
+        mode = '强制结束' if force else '结束进程'
+        explanation = ('立即终止所选进程，未保存的数据将无法恢复；不结束子进程。' if force
+                       else system.STOP_EXPLANATION)
+        answer = QMessageBox.question(self, mode,
+            f'是否{mode} {name}（PID {key[0]}）？\n{path}\n\n未保存的数据可能丢失。'
+            f'\n{explanation}',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel)
         if answer != QMessageBox.StandardButton.Yes or self.closed:
             return
         self.stopping = True
-        self.stop_button.setEnabled(False)
+        self.update_stop_buttons()
         if self.key == key:
-            self.operation.setText(f'正在请求结束 PID {key[0]}…')
+            self.operation.setText(f'正在请求{mode} PID {key[0]}…')
 
         def show(message):
             if not self.closed and self.key == key:
@@ -181,15 +211,18 @@ class ProcessPanel(QWidget):
 
         def finished():
             self.stopping = False
+            self.update_stop_buttons()
             if not self.closed:
                 self.request_details()
                 if self.refresh:
                     self.refresh()
 
-        self.run_job(lambda: system.stop_process(key), lambda result: show(result.message), show, finished)
+        self.run_job(lambda: system.stop_process(key, force=True) if force else system.stop_process(key),
+                     lambda result: show(result.message), show, finished)
 
     def shutdown(self):
         self.closed = True
+        self.analysis.shutdown()
 
 
 class ProcessIcons(QObject):

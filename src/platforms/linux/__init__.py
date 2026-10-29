@@ -1,12 +1,15 @@
 """Linux 适配入口：XDG应用、inotify通知与安全的单进程SIGTERM。"""
 from ..common import (
     FONT_FAMILY, SCAN_NAME, is_link, list_disks, process_options,
-    python_executable, recycle, scan_native, allocated_bytes, open_metadata,
+    python_executable, recycle, scan_native, allocated_bytes, open_metadata, context_counters,
 )
 from .apps import scan_apps
 from .icons import load_app_icons, load_process_icons
 from .processes import stop_process
 from .watch import DirectoryWatch
+from .analysis import sample_memory_breakdown, thread_identity
+from .process_trace import FileTrace
+from .identity import process_created
 
 
 NAME = 'Linux'

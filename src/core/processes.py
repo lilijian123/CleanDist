@@ -43,6 +43,7 @@ class ProcessDetails:
     cpu_time: float | None = None
     captured_at: float = 0
     errors: tuple = ()
+    started_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -53,11 +54,12 @@ class StopResult:
 
 
 def matching_process(key):
+    from ..platforms import system
     pid, created = key
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or not math.isfinite(created) or created <= 0:
         raise ValueError('无效的进程身份')
     process = psutil.Process(pid)
-    if process.create_time() != created or not process.is_running():
+    if system.process_created(process) != created or not process.is_running():
         raise ValueError('进程已退出或 PID 已被复用，请重新选择')
     return process
 
@@ -84,11 +86,12 @@ def sample_process_details(key):
         memory = read('内存', process.memory_info)
         private = read(system.PRIVATE_MEMORY_LABEL, lambda: system.private_memory(process, memory))
         cpu = read('CPU', process.cpu_times)
+        started_at = read('启动时间', process.create_time)
     parent_name = None
     if parent_pid:
         try:
             parent = psutil.Process(parent_pid)
-            if parent.create_time() <= key[1]:
+            if system.process_created(parent) <= key[1]:
                 parent_name = parent.name()
         except psutil.Error:
             pass
@@ -98,7 +101,7 @@ def sample_process_details(key):
                           threads, handles, memory.rss if memory is not None else None,
                           private,
                           cpu.user + cpu.system if cpu is not None else None,
-                          time.monotonic(), tuple(errors))
+                          time.monotonic(), tuple(errors), started_at)
 
 
 def cpu_percentage(previous, current, logical_cpus=None):

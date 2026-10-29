@@ -6,6 +6,7 @@ from pathlib import Path
 import psutil
 
 from .apps import data_dirs, desktop_entry
+from .identity import process_created
 
 
 def icon_dirs():
@@ -96,7 +97,7 @@ def load_process_icons(keys, cancel):
         data = b''
         try:
             process = psutil.Process(key[0])
-            if process.create_time() == key[1] and process.is_running():
+            if process_created(process) == key[1] and process.is_running():
                 executable = Path(process.exe())
                 if executable.is_absolute():
                     if by_executable is None:
@@ -109,7 +110,7 @@ def load_process_icons(keys, cancel):
                         if icon not in images:
                             images[icon] = read_icon(icon, cancel=cancel)
                         data = images[icon]
-                    if process.create_time() != key[1] or not process.is_running():
+                    if process_created(process) != key[1] or not process.is_running():
                         data = b''
         except (psutil.Error, OSError, ValueError):
             pass

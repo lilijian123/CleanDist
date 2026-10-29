@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import time
 
 import psutil
+from ..platforms import system
 
 
 @dataclass(frozen=True)
@@ -80,10 +81,10 @@ def sample_memory(history):
             if info is None:
                 unreadable += 1
             samples.append(ProcessSample(
-                data['pid'], data['create_time'], data['name'] or f"进程 {data['pid']}",
+                data['pid'], system.process_created(process), data['name'] or f"进程 {data['pid']}",
                 info.rss if info is not None else None,
             ))
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError, ValueError):
             unreadable += 1
     now = time.monotonic()
     return MemorySnapshot(memory.total, memory.available, memory.percent,
