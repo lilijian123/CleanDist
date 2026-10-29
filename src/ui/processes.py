@@ -15,7 +15,7 @@ from .process_analysis import AnalysisPane
 
 class ProcessPanel(QWidget):
     """只为选中进程采集详情；旧选择、关闭后的回调不会更新界面。"""
-    def __init__(self, run_job, refresh=None):
+    def __init__(self, run_job, refresh=None, fast_job=None):
         super().__init__()
         self.run_job, self.refresh = run_job, refresh
         self.key = None
@@ -97,7 +97,7 @@ class ProcessPanel(QWidget):
         self.note.setWordWrap(True)
         layout.addWidget(self.note)
         layout.addStretch()
-        self.analysis = AnalysisPane(run_job)
+        self.analysis = AnalysisPane(run_job, fast_job=fast_job)
         self.details_tabs.addTab(self.analysis, '资源分析')
 
     def change_chart(self, *_):
@@ -114,7 +114,7 @@ class ProcessPanel(QWidget):
         if self.closed:
             return
         key = reading.key if reading else None
-        self.analysis.set_key(key)
+        self.analysis.set_key(key, reading.name if reading else '')
         if key != self.key:
             self.key, self.details = key, None
             self.update_stop_buttons()

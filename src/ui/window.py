@@ -27,6 +27,7 @@ from .treemap import MapPage
 from .theme import STYLE, LIGHT_STYLE, color
 from .widgets import BrandMark, CachedDelegate, FocusEdit, Metric, NumberItem, SettingsButton, ThemeChoice, TrendChart, button, enable_pixel_scroll, label, format_size, number_font, table
 from .workers import Job
+from .ai import AiSettingsPage
 
 
 class MainWindow(QMainWindow):
@@ -44,6 +45,8 @@ class MainWindow(QMainWindow):
         self.jobs = {}
         self.thread_pool = QThreadPool(self)
         self.thread_pool.setMaxThreadCount(3)
+        self.analysis_pool = QThreadPool(self)
+        self.analysis_pool.setMaxThreadCount(1)
         self.history = MemoryHistory()
         self.memory_snapshot = None
         self.memory_busy = False
@@ -141,9 +144,13 @@ class MainWindow(QMainWindow):
         self.settings_nav.setObjectName('settingsNav')
         self.settings_nav.setFixedWidth(176)
         self.settings_nav.addItem('外观')
+        self.settings_nav.addItem('AI 设置')
         self.settings_nav.setCurrentRow(0)
         body.addWidget(self.settings_nav)
-        appearance = QVBoxLayout()
+        self.settings_stack = QStackedWidget()
+        appearance_page = QWidget()
+        appearance = QVBoxLayout(appearance_page)
+        appearance.setContentsMargins(0, 0, 0, 0)
         appearance.setSpacing(18)
         appearance.addWidget(label('外观', 'title'))
         card = QFrame()
@@ -162,9 +169,19 @@ class MainWindow(QMainWindow):
         row.addWidget(self.theme_combo)
         appearance.addWidget(card)
         appearance.addStretch()
-        body.addLayout(appearance, 1)
+        self.settings_stack.addWidget(appearance_page)
+        self.ai_settings = AiSettingsPage(self.settings, self.run_job)
+        self.settings_stack.addWidget(self.ai_settings)
+        self.settings_nav.currentRowChanged.connect(self.settings_stack.setCurrentIndex)
+        body.addWidget(self.settings_stack, 1)
         layout.addLayout(body, 1)
         self.pages.addWidget(self.settings_page)
+        self.process_panel.analysis.ai.settings_page = self.ai_settings
+        self.process_panel.analysis.ai.open_settings = self.show_ai_settings
+
+    def show_ai_settings(self):
+        self.settings_nav.setCurrentRow(1)
+        self.show_settings()
 
     def show_settings(self):
         self.pages.setCurrentWidget(self.settings_page)
@@ -257,7 +274,8 @@ class MainWindow(QMainWindow):
         self.process_icons = ProcessIcons(self.memory_table, self.run_job, self)
         list_layout.addWidget(self.memory_table, 1)
         split.addWidget(listing)
-        self.process_panel = ProcessPanel(self.run_job, self.request_memory)
+        self.process_panel = ProcessPanel(self.run_job, self.request_memory,
+            fast_job=lambda *args: self.run_job(*args, pool=self.analysis_pool))
         self.chart = self.process_panel.chart
         self.trend_title = self.process_panel.title
         details = QScrollArea()
@@ -441,7 +459,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(actions)
         self.tabs.addTab(page, '02  文件增长与清理')
 
-    def run_job(self, action, success, failure, finished=None):
+    def run_job(self, action, success, failure, finished=None, *, pool=None):
         if self.closing:
             return
         job = Job(action)
@@ -456,7 +474,7 @@ class MainWindow(QMainWindow):
                 finished()
 
         job.signals.finished.connect(done)
-        self.thread_pool.start(job)
+        (pool if pool is not None else self.thread_pool).start(job)
 
     def request_memory(self):
         if self.closing or self.memory_busy:
@@ -950,6 +968,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.closing = True
+        self.ai_settings.shutdown()
         self.process_panel.shutdown()
         self.process_icons.shutdown()
         for dialog in self.findChildren(StorageDialog):

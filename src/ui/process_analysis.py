@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QComboBox, QGridLayout, QHBoxLayout, QHeaderView,
 from ..core.process_analysis import AnalysisHistory, sample_analysis
 from ..platforms import system
 from .widgets import TrendChart, button, format_size, label, table
+from .ai import ProcessAiWidget
 
 
 def percentage(value, signed=False):
@@ -28,13 +29,18 @@ def byte_rate(value, signed=False):
 
 
 class AnalysisPane(QWidget):
-    def __init__(self, run_job, parent=None):
+    def __init__(self, run_job, parent=None, fast_job=None):
         super().__init__(parent)
         self.run_job = run_job
+        self.run_fast_job = fast_job or run_job
         self.key = self.report = self.trace = None
+        self.process_name = ''
+        self.report_at = None
         self.closing_trace = None
         self.history = AnalysisHistory()
         self.busy = self.closed = False
+        self.deep_busy = False
+        self.detail_error = ''
         self.last_deep = None
         self.trace_version = None
         self.deep_tables = None
@@ -52,7 +58,7 @@ class AnalysisPane(QWidget):
         layout.addWidget(self.findings)
         line = QHBoxLayout()
         self.section = QComboBox()
-        for caption in ('内存构成', 'CPU / 线程', 'I/O / 资源', '文件关联'):
+        for caption in ('内存构成', 'CPU / 线程', 'I/O / 资源', '文件关联', 'AI 分析与预测'):
             self.section.addItem(caption)
         line.addWidget(self.section, 1)
         layout.addLayout(line)
@@ -110,6 +116,8 @@ class AnalysisPane(QWidget):
         self.events.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.events.setColumnWidth(0, 125)
         self.stack.addWidget(files)
+        self.ai = ProcessAiWidget(lambda: (self.report, self.process_name, self.report_at), self)
+        self.stack.addWidget(self.ai)
         layout.addWidget(self.stack)
         self.section.currentIndexChanged.connect(self.stack.setCurrentIndex)
         line = QHBoxLayout()
@@ -173,11 +181,16 @@ class AnalysisPane(QWidget):
         super().showEvent(event)
         QTimer.singleShot(0, self.request_sample)
 
-    def set_key(self, key):
+    def set_key(self, key, name=None):
+        if name is not None:
+            self.process_name = name
         if self.closed or key == self.key:
             return
         self.stop_trace()
         self.key, self.report, self.last_deep = key, None, None
+        self.detail_error = ''
+        self.report_at = None
+        self.ai.reset()
         self.history.reset()
         self.deep_tables = None
         self.findings.clear()
@@ -197,21 +210,22 @@ class AnalysisPane(QWidget):
         if self.closed or self.busy or not self.key or not self.isVisible():
             return
         key = self.key
-        deep = self.last_deep is None or time.monotonic() - self.last_deep >= 5
-        if deep:
-            self.last_deep = time.monotonic()
         self.busy = True
 
         def accept(sample):
             if self.closed or self.key != key or sample.key != key:
                 return
             self.report = self.history.add(sample)
+            self.report_at = sample.counter_at if sample.counter_at is not None else sample.captured_at
             self.render_report()
+            self.request_details()
 
         def failed(error):
             if not self.closed and self.key == key:
                 self.status.setText(f'分析暂不可用：{error}')
                 self.report = None
+                self.report_at = None
+                self.ai.refresh()
                 self.history.reset()
                 self.deep_tables = None
                 self.last_deep = None
@@ -228,7 +242,36 @@ class AnalysisPane(QWidget):
             if not self.closed and key != self.key:
                 self.request_sample()
 
-        self.run_job(lambda: sample_analysis(key, deep=deep), accept, failed, finished)
+        self.run_fast_job(lambda: sample_analysis(key, deep=False), accept, failed, finished)
+
+    def request_details(self):
+        if (self.closed or self.deep_busy or not self.key or self.report is None or not self.isVisible()
+                or self.last_deep is not None and time.monotonic() - self.last_deep < 5):
+            return
+        key = self.key
+        self.deep_busy = True
+        self.last_deep = time.monotonic()
+
+        def accept(sample):
+            if not self.closed and self.key == key and sample.key == key:
+                report = self.history.update_details(sample)
+                if report is not None:
+                    self.report = report
+                    self.detail_error = ''
+                    self.render_report()
+
+        def failed(error):
+            if not self.closed and self.key == key:
+                self.detail_error = f'详细采样暂不可用：{error}'
+                if self.report is not None:
+                    self.render_report()
+
+        def finished():
+            self.deep_busy = False
+            if not self.closed and self.key != key:
+                self.request_details()
+
+        self.run_job(lambda: sample_analysis(key, deep=True), accept, failed, finished)
 
     def rows(self, view, rows):
         scroll = view.verticalScrollBar().value()
@@ -247,13 +290,15 @@ class AnalysisPane(QWidget):
 
     def render_report(self):
         report = self.report
+        self.ai.refresh()
         age = f'{report.deep_age:.0f}秒前' if report.deep_age is not None else '暂无'
-        self.status.setText(f'观察 {report.seconds:.0f}秒 · {report.samples}次采样 · 详细快照 {age}')
+        suffix = ' · 详细指标采集中' if self.deep_busy else ''
+        self.status.setText(f'观察 {report.seconds:.0f}秒 · {report.samples}次采样 · 详细快照 {age}{suffix}')
         for name, (value, formatter) in self.values.items():
             value.setText(formatter(report.metrics.get(name)))
         self.findings.setPlainText('\n\n'.join(f'{item.title}\n{item.evidence}' for item in report.findings)
             or '暂未积累足够的持续变化证据。正常波动也可能引起增长，不能据此直接判断泄漏或卡死。')
-        self.errors.setText('\n'.join(report.errors[:6]))
+        self.errors.setText('\n'.join((*report.errors[:6], *((self.detail_error,) if self.detail_error else ()))))
         self.errors.setToolTip('\n'.join(report.errors))
         deep_version = report.deep_at, report.deep_age is not None and 0 <= report.deep_age <= 15
         if deep_version != self.deep_tables:
@@ -335,6 +380,7 @@ class AnalysisPane(QWidget):
 
     def shutdown(self):
         self.closed = True
+        self.ai.shutdown()
         self.timer.stop()
         self.trace_timer.stop()
         self.stop_trace()

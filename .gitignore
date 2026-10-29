@@ -1,5 +1,8 @@
 .venv/
 .venv-linux/
+/.env
+/.env.key
+/.env.*.tmp
 docs/
 tests/
 test/

@@ -175,13 +175,27 @@ class AnalysisHistory:
         self.window = max(1, window)
         self.logical_cpus = max(1, logical_cpus or psutil.cpu_count() or 1)
         self._points = deque(maxlen=max(2, max_samples))
+        self._deep_points = deque(maxlen=max(2, max_samples))
         self._deep = None
         self._threads = ()
 
     def reset(self):
         self._points.clear()
+        self._deep_points.clear()
         self._deep = None
         self._threads = ()
+
+    def update_details(self, sample):
+        if not self._points or sample.key != self._points[-1][0].key or sample.deep_at is None:
+            return None
+        latest, _ = self._points.pop()
+        self._set_details(sample)
+        return self.add(replace(latest, deep_at=None))
+
+    def _set_details(self, sample):
+        self._update_threads(sample)
+        self._deep = sample
+        self._deep_points.append(sample)
 
     def add(self, sample):
         previous = self._points[-1][0] if self._points else None
@@ -201,9 +215,8 @@ class AnalysisHistory:
             if metrics['cpu_user_percent'] is not None and metrics['cpu_system_percent'] is not None:
                 metrics['cpu_percent'] = min(100, metrics['cpu_user_percent'] + metrics['cpu_system_percent'])
         if sample.deep_at is not None:
-            self._update_threads(sample)
-            self._deep = sample
-        deep_age = sample.captured_at - self._deep.deep_at if self._deep else None
+            self._set_details(sample)
+        deep_age = max(sample.captured_at, self._deep.captured_at) - self._deep.deep_at if self._deep else None
         fresh = deep_age is not None and 0 <= deep_age <= 15
         errors = list(sample.errors)
         if fresh:
@@ -218,6 +231,8 @@ class AnalysisHistory:
         cutoff = sample.captured_at - self.window
         while self._points and self._points[0][0].captured_at < cutoff:
             self._points.popleft()
+        while self._deep_points and self._deep_points[0].deep_at < cutoff:
+            self._deep_points.popleft()
         curves = {name: [(point.captured_at, values.get(name)) for point, values in self._points]
                   for name in METRICS}
         seconds = sample.captured_at - self._points[0][0].captured_at
@@ -260,7 +275,8 @@ class AnalysisHistory:
             # 权限缺口后的连续有效区段才算观察窗口。
             points = []
             deep_seen = set()
-            for sample, values in self._points:
+            observations = ((sample, sample.metrics) for sample in self._deep_points) if name in DEEP_METRICS else self._points
+            for sample, values in observations:
                 captured_at = sample.captured_at
                 if name in DEEP_METRICS:
                     if sample.deep_at is None or sample.deep_at in deep_seen:

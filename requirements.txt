@@ -5,3 +5,4 @@ shiboken6==6.12.0; sys_platform != 'linux'
 PySide6-Essentials==6.11.2; sys_platform == 'linux'
 shiboken6==6.11.2; sys_platform == 'linux'
 Send2Trash==2.1.0
+cryptography==50.0.2

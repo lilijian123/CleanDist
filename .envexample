@@ -1,0 +1,9 @@
+# CleanDist local encrypted credentials template.
+# The application creates .env and .env.key automatically on first launch.
+# Enter your DeepSeek API Key in Settings -> AI Settings, then click Save.
+# Never place a plaintext API Key here. The application writes a Fernet token.
+DEEPSEEK_API_KEY_ENCRYPTED=
+
+# .env.key is generated separately; do not copy a key from another installation.
+# Keep .env and .env.key together when backing up local credentials.
+# Both generated files and temporary writes are excluded by .gitignore.
