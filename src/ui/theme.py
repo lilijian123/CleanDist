@@ -12,6 +12,11 @@ QLabel#muted { color: #8b8e87; }
 QLabel#pill { color: #a8c8b5; background: #20201e; border: 0; border-radius: 12px; padding: 6px 12px; }
 QFrame#card { background: #1a1a19; border: 0; border-radius: 13px; }
 QFrame#card QLabel { background: transparent; }
+QFrame#scanCard { background: #1a1a19; border: 1px solid #292b26; border-radius: 12px; }
+QFrame#scanCard QLabel { background: transparent; border: 0; }
+QLabel#scanTitle { font-size: 13px; color: #8b8e87; }
+QLabel#scanValue { font-size: 28px; font-weight: 610; color: #e5e5df; }
+QLabel#scanUnit { font-size: 15px; color: #8b8e87; }
 QLabel#metric { font-size: 27px; font-weight: 660; color: #e5e5df; }
 QLabel#processMetric { font-size: 17px; font-weight: 560; color: #e5e5df; }
 QLabel#section { font-size: 16px; font-weight: 610; }
@@ -75,7 +80,7 @@ for dark, light in {
     '#747e73': '#8b9588', '#694244': '#f1dcdc', '#eedcdb': '#853d42',
     '#3c493e': '#d5e3d6', '#171716': '#f0f0ed', '#2b302a': '#e2e8df',
     '#c6d8c8': '#365c43', '#293029': '#e0e9df', '#e1e8de': '#253d2b',
-    '#a4a89d': '#666a60', '#3b3d37': '#cecec7', '#55584e': '#adada4',
+    '#a4a89d': '#666a60', '#3b3d37': '#cecec7', '#55584e': '#adada4', '#292b26': '#e5e5df',
 }.items():
     LIGHT_STYLE = LIGHT_STYLE.replace(dark, light)
 for weight in (760, 660, 610, 560, 360):

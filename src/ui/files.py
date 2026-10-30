@@ -1,7 +1,7 @@
 """按批次生成 Qt 原生树条目，滚动时复用显示值，无需逐个创建控件。"""
 from datetime import datetime
 
-from PySide6.QtCore import QEvent, QModelIndex, QRectF, Qt
+from PySide6.QtCore import QEvent, QModelIndex, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import QApplication, QStyle
 from ..core.analysis import DirectoryEntry, rank_files
@@ -10,6 +10,7 @@ from .theme import color
 
 
 class FileModel(QStandardItemModel):
+    checkedChanged = Signal()
     BATCH = 200
     HEADERS = ('名称 / 相对路径', '大小 / 占比', '文件数', '本轮增量', '状态', '修改时间')
 
@@ -18,6 +19,10 @@ class FileModel(QStandardItemModel):
         self.analysis = None
         self.nodes = {}
         self.checked = {}
+        self.checked_counts = {}
+        self.blocked = set()
+        self.blocked_counts = {}
+        self.syncing_checks = False
         self.flat = False
         self.entries = []
         self.children = {}
@@ -31,7 +36,7 @@ class FileModel(QStandardItemModel):
         self.number_font = number_font()
         self.setHorizontalHeaderLabels(self.HEADERS)
         self.horizontalHeaderItem(1).setToolTip('占本次已扫描文件逻辑总大小的比例，不代表实际磁盘使用率。')
-        self.itemChanged.connect(self._selection_changed)
+        self.dataChanged.connect(self._selection_changed)
         if parent is not None:
             parent.installEventFilter(self)
 
@@ -53,8 +58,16 @@ class FileModel(QStandardItemModel):
         self.entries = (rank_files(analysis, mode, min_size, query) if self.flat else self.children['']) if analysis else []
         self.nodes = {}
         files = analysis.snapshot.files if analysis else {}
+        cleanup = analysis.cleanup if analysis else None
+        self.blocked = {record.relative for record in cleanup.readonly_records()} if cleanup else set()
+        self.blocked_counts = {}
+        for key in self.blocked:
+            self._count_path(self.blocked_counts, files[key], 1)
         self.checked = {key: files[key] for key, old in self.checked.items()
-                        if key in files and files[key].fingerprint == old.fingerprint}
+                        if key in files and key not in self.blocked and files[key].root == old.root and files[key].fingerprint == old.fingerprint}
+        self.checked_counts = {}
+        for record in self.checked.values():
+            self._adjust_counts(record, 1)
         self.root.fetched = True
         self._append_nodes(self.root, self.entries[:self.BATCH])
 
@@ -79,16 +92,20 @@ class FileModel(QStandardItemModel):
                 first.setColumnCount(len(self.HEADERS))
             first.setIcon(self.group_icon if directory and entry.state == '明细分组' else self.folder_icon if directory else self.file_icon)
             items[1].setData(share, Qt.ItemDataRole.UserRole)
-            tooltip = '汇总项，展开后勾选具体文件' if directory else str(entry.record.path)
+            tooltip = ('勾选本项可选择其中已扫描的文件；文件夹本身保留。' if directory else str(entry.record.path))
+            if entry.relative in self.blocked:
+                tooltip += '\n仅查看：' + self.analysis.cleanup.by_file[entry.relative].reason
+            elif directory and self.blocked_counts.get(entry.relative):
+                tooltip += '\n系统管理或高风险文件仅查看，不参与批选。'
             for column, item in enumerate(items):
                 item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 item.setToolTip(tooltip)
                 if column in (1, 2, 3):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            if not directory and entry.count:
+            selectable = entry.count - self.blocked_counts.get(entry.relative, 0) if directory else int(entry.count and entry.relative not in self.blocked)
+            if selectable:
                 first.setFlags(first.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                first.setData(Qt.CheckState.Checked if entry.relative in self.checked else Qt.CheckState.Unchecked,
-                              Qt.ItemDataRole.CheckStateRole)
+                first.setData(self._check_state(entry), Qt.ItemDataRole.CheckStateRole)
             self._style_row(items, entry)
             self.nodes[entry.relative] = first
             node.appendRow(items)
@@ -157,14 +174,81 @@ class FileModel(QStandardItemModel):
             return False
         return super().setData(index, Qt.CheckState(value), role)
 
-    def _selection_changed(self, item):
-        entry = getattr(item, 'entry', None)
-        if entry is None or isinstance(entry, DirectoryEntry) or not entry.count:
+    def _adjust_counts(self, record, delta):
+        self._count_path(self.checked_counts, record, delta)
+
+    def _count_path(self, counts, record, delta):
+        parent = record.relative.rpartition('/')[0]
+        group = '\0small/' + parent
+        if record.size < 1024 * 1024 and group in self.children:
+            counts[group] = counts.get(group, 0) + delta
+        while True:
+            counts[parent] = counts.get(parent, 0) + delta
+            if not parent:
+                break
+            parent = parent.rpartition('/')[0]
+
+    def _check_state(self, entry):
+        if not isinstance(entry, DirectoryEntry):
+            return Qt.CheckState.Checked if entry.relative in self.checked else Qt.CheckState.Unchecked
+        count = self.checked_counts.get(entry.relative, 0)
+        eligible = entry.count - self.blocked_counts.get(entry.relative, 0)
+        return (Qt.CheckState.Checked if count == eligible and count else
+                Qt.CheckState.PartiallyChecked if count else Qt.CheckState.Unchecked)
+
+    def _entry_records(self, entry):
+        pending = [entry]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, DirectoryEntry):
+                pending.extend(self.children.get(current.relative, ()))
+            elif current.count and current.relative not in self.blocked:
+                record = self.analysis.snapshot.files.get(current.relative)
+                if record is not None:
+                    yield record
+
+    def _sync_checks(self):
+        parents = {}
+        self.syncing_checks = True
+        previous = self.blockSignals(True)
+        try:
+            for node in self.nodes.values():
+                if not node.entry.count:
+                    continue
+                state = self._check_state(node.entry)
+                if node.checkState() != state:
+                    node.setCheckState(state)
+                    parent = node.parent()
+                    parents[parent.entry.relative if parent is not None else None] = parent.index() if parent is not None else QModelIndex()
+        finally:
+            self.blockSignals(previous)
+        try:
+            for parent in parents.values():
+                self.dataChanged.emit(self.index(0, 0, parent), self.index(self.rowCount(parent) - 1, 0, parent),
+                                      [Qt.ItemDataRole.CheckStateRole])
+        finally:
+            self.syncing_checks = False
+
+    def _selection_changed(self, top_left, bottom_right, roles):
+        if self.syncing_checks or Qt.ItemDataRole.CheckStateRole not in roles:
             return
-        if item.checkState() == Qt.CheckState.Checked:
-            self.checked[entry.relative] = entry.record
-        else:
-            self.checked.pop(entry.relative, None)
+        item = self.itemFromIndex(top_left)
+        entry = getattr(item, 'entry', None)
+        if entry is None or not entry.count or item.checkState() == Qt.CheckState.PartiallyChecked:
+            return
+        selected = item.checkState() == Qt.CheckState.Checked
+        changed = False
+        for record in self._entry_records(entry):
+            if selected != (record.relative in self.checked):
+                if selected:
+                    self.checked[record.relative] = record
+                else:
+                    self.checked.pop(record.relative)
+                self._adjust_counts(record, 1 if selected else -1)
+                changed = True
+        if changed:
+            self._sync_checks()
+            self.checkedChanged.emit()
 
     def selected_records(self):
         return list(self.checked.values())

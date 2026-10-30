@@ -146,17 +146,22 @@ def analyze_usage(snapshot, cancel=None, progress=None):
     return result
 
 
+SAMPLE_BYTES = 16 * 1024
+SMALL_FULL_BYTES = 64 * 1024
+
+
 def file_digest(record, cancel, sample, seen=None):
     digest = hashlib.sha256()
     with checked_file(record, cancel) as (stream, live):
         if seen is not None and (live.device, live.inode) in seen:
             return None, live
-        if sample:
-            for offset in sorted({0, max(0, live.size // 2 - 32768), max(0, live.size - 65536)}):
+        if sample and live.size > SMALL_FULL_BYTES:
+            tail = live.size - SAMPLE_BYTES
+            for offset in (0, tail // 2, tail):
                 if cancel.is_set():
                     raise Cancelled()
                 stream.seek(offset)
-                digest.update(stream.read(65536))
+                digest.update(stream.read(SAMPLE_BYTES))
         else:
             while True:
                 if cancel.is_set():
@@ -168,7 +173,9 @@ def file_digest(record, cancel, sample, seen=None):
     return digest.digest(), live
 
 
-def find_duplicates(snapshot, cancel=None, progress=None):
+def find_duplicates(snapshot, cancel=None, progress=None, *, minimum_bytes=1):
+    if minimum_bytes < 1:
+        raise ValueError('最小文件大小必须大于0')
     cancel = cancel or threading.Event()
     result = DuplicateResult(snapshot_complete=snapshot.complete)
     sizes = defaultdict(list)
@@ -176,10 +183,11 @@ def find_duplicates(snapshot, cancel=None, progress=None):
         if cancel.is_set():
             result.cancelled = True
             return result
-        if record.size:
+        if record.size >= minimum_bytes:
             sizes[record.size].append(record)
     candidates = [record for group in sizes.values() if len(group) > 1 for record in group]
     samples = defaultdict(list)
+    hashes = defaultdict(list)
     seen = set()
     for index, record in enumerate(sorted(candidates, key=lambda record: record.relative.casefold())):
         if cancel.is_set():
@@ -191,7 +199,11 @@ def find_duplicates(snapshot, cancel=None, progress=None):
                 result.hardlinks += 1
                 continue
             seen.add(identity)
-            samples[(live.size, digest)].append(live)
+            # 小文件在首次打开时已完整读取，不能再走第二轮完整哈希。
+            if live.size <= SMALL_FULL_BYTES:
+                hashes[(live.size, digest)].append(live)
+            else:
+                samples[(live.size, digest)].append(live)
             result.checked += 1
         except Cancelled:
             break
@@ -199,7 +211,6 @@ def find_duplicates(snapshot, cancel=None, progress=None):
             note_error(result, record, error)
         if progress and index % 16 == 0:
             progress('筛选内容指纹', index + 1, len(candidates))
-    hashes = defaultdict(list)
     full = [record for group in samples.values() if len(group) > 1 for record in group]
     for index, record in enumerate(full):
         if cancel.is_set():

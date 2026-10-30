@@ -4,6 +4,7 @@ from heapq import nlargest
 import time
 
 from .files import ScanProgress, diff_snapshots
+from .cleanup import classify_cleanup
 
 
 @dataclass(slots=True)
@@ -26,9 +27,10 @@ class FileAnalysis:
     children: dict
     comparable: bool
     growth_children: dict
+    cleanup: object = None
 
 
-def analyze_files(previous, snapshot, cancel=None, progress=None):
+def analyze_files(previous, snapshot, cancel=None, progress=None, *, include_growth=True, include_cleanup=True):
     start = time.monotonic()
 
     def report(stage):
@@ -100,11 +102,18 @@ def analyze_files(previous, snapshot, cancel=None, progress=None):
         comparison = replace(snapshot, files={**previous.files, **snapshot.files})
     comparable = snapshot.complete and (previous is None or previous.complete)
     growth_children = {}
-    for index, (key, entries) in enumerate(children.items()):
+    for index, (key, entries) in enumerate(children.items() if include_growth else ()):
         if index % 4096 == 0 and report('排序增长明细'):
             return None
         growth_children[key] = sorted(entries, key=lambda entry: (-entry.delta, -entry.size, entry.relative.casefold()))
-    return FileAnalysis(snapshot, comparison, changes, directories, children, comparable, growth_children)
+    cleanup = None
+    if include_cleanup:
+        if report('识别清理类别'):
+            return None
+        cleanup = classify_cleanup(snapshot, cancel=cancel)
+        if cleanup is None:
+            return None
+    return FileAnalysis(snapshot, comparison, changes, directories, children, comparable, growth_children, cleanup)
 
 
 def rank_files(analysis, mode, min_size=0, query=''):

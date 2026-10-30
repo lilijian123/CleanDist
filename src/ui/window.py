@@ -3,6 +3,8 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 import threading
+import os
+from dataclasses import replace
 import time
 
 import psutil
@@ -10,29 +12,34 @@ from PySide6.QtCore import QModelIndex, QSettings, QSize, Qt, QThreadPool, QTime
 from PySide6.QtGui import QColor, QCursor, QFont, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
-    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar, QTabWidget, QTableWidgetItem,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar, QTabWidget, QTabBar, QToolButton, QTableWidgetItem,
     QScrollArea, QSplitter, QStackedWidget, QTextEdit, QTreeView, QVBoxLayout, QWidget,
 )
-from ..core.files import execute_cleanup, prepare_cleanup, scan_directory, validate_plain_path
+from ..core.batch import ScanBatch, record_key, scan_batch, analyze_batch, build_matrix
+from ..core.batch_cleanup import prepare_batch_cleanup, execute_batch_cleanup
+from ..core.cleanup import CleanupAnalysis
+from ..core.ai import summarize_cleanup
+from ..core.storage import find_duplicates
 from ..core.analysis import analyze_files
 from ..platforms import system
 from ..core.memory import MemoryHistory, sample_memory
 from .. import APP_NAME
 from .dialogs import PreviewDialog
+from .cleanup import CleanupPage
 from .apps import AppPage
-from .files import FileModel, SizeDelegate
+from .file_tools import LargeFilesPage, DuplicatePage
 from .processes import ProcessIcons, ProcessPanel
-from .storage import StorageDialog
 from .treemap import MapPage
 from .theme import STYLE, LIGHT_STYLE, color
-from .widgets import BrandMark, CachedDelegate, FocusEdit, Metric, NumberItem, SettingsButton, ThemeChoice, TrendChart, button, enable_pixel_scroll, label, format_size, number_font, table
+from .widgets import BrandMark, CachedDelegate, FocusEdit, Metric, ScanMetric, NumberItem, SettingsButton, ThemeChoice, TrendChart, button, enable_click_selection, enable_pixel_scroll, label, format_size, number_font, table
 from .workers import Job
-from .ai import AiSettingsPage
+from .ai import AiSettingsPage, FileAiDialog
 
 
 class MainWindow(QMainWindow):
     def __init__(self, settings=None):
         super().__init__()
+        enable_click_selection()
         self.setWindowTitle(f'{APP_NAME} · {system.NAME}')
         self.resize(1260, 870)
         self.setMinimumSize(1050, 760)
@@ -52,21 +59,25 @@ class MainWindow(QMainWindow):
         self.memory_busy = False
         self.selected_process = None
         self.current_snapshot = None
-        self.comparison_snapshot = None
-        self.file_changes = []
-        self.file_analysis = None
-        self.file_view_key = None
-        self.directory_watch = None
-        self.last_scan_time = 0
-        self.scan_started_at = 0
-        self.scan_progress = None
-        self.scan_pending = False
+        self.batch_analysis = None
+        self.roots = ()
+        self.root = None
+        self.scan_kind = 'folder'
+        self.selected_disks = set()
         self.scan_generation = 0
         self.scan_busy = False
         self.scan_cancel = threading.Event()
-        self.monitoring = False
-        self.root = None
-        self.scan_kind = 'folder'
+        self.scan_progress = {}
+        self.scan_started_at = 0
+        self.content_generation = 0
+        self.content_cancel = threading.Event()
+        self.matrix_key = None
+        self.duplicate_key = None
+        self.duplicate_result = None
+        self.scan_pool = QThreadPool(self)
+        self.scan_pool.setMaxThreadCount(1)
+        self.content_pool = QThreadPool(self)
+        self.content_pool.setMaxThreadCount(1)
         self.cleanup_busy = False
         self.reports = deque(maxlen=20)
         self.demo_process = None
@@ -78,8 +89,8 @@ class MainWindow(QMainWindow):
         self.memory_timer.timeout.connect(self.request_memory)
         self.memory_timer.start(1000)
         self.file_timer = QTimer(self)
-        self.file_timer.timeout.connect(self.poll_directory)
-        self.file_timer.setInterval(1000)
+        self.file_timer.timeout.connect(self.poll_scan)
+        self.file_timer.setInterval(100)
         QTimer.singleShot(0, self.request_memory)
 
     def showEvent(self, event):
@@ -178,6 +189,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.settings_page)
         self.process_panel.analysis.ai.settings_page = self.ai_settings
         self.process_panel.analysis.ai.open_settings = self.show_ai_settings
+        self.file_ai_dialog = FileAiDialog(self.ai_settings, self.show_ai_settings, self)
 
     def show_ai_settings(self):
         self.settings_nav.setCurrentRow(1)
@@ -221,7 +233,8 @@ class MainWindow(QMainWindow):
         font = number_font(light)
         self.setFont(font)
         self.apps_page.model.number_font = font
-        self.file_model.set_fonts(font, 700 if light else 660)
+        for page in (self.cleanup_page, self.large_page, self.duplicate_page):
+            page.model.set_fonts(font, 700 if light else 660)
         for metric in self.findChildren(Metric):
             metric.value.setFont(font)
         for row in range(self.memory_table.rowCount()):
@@ -235,7 +248,8 @@ class MainWindow(QMainWindow):
         for delegate in self.findChildren(CachedDelegate):
             delegate.cache.clear()
         self.chart.update()
-        self.file_tree.viewport().update()
+        for page in (self.cleanup_page, self.large_page, self.duplicate_page):
+            page.tree.viewport().update()
         self.apps_page.table.viewport().update()
         self.settings.setValue('theme', 'light' if light else 'dark')
         self.settings.sync()
@@ -278,12 +292,8 @@ class MainWindow(QMainWindow):
             fast_job=lambda *args: self.run_job(*args, pool=self.analysis_pool))
         self.chart = self.process_panel.chart
         self.trend_title = self.process_panel.title
-        details = QScrollArea()
-        details.setWidgetResizable(True)
-        details.setFrameShape(QFrame.Shape.NoFrame)
-        details.setMinimumWidth(380)
-        details.setWidget(self.process_panel)
-        split.addWidget(details)
+        self.process_panel.setMinimumWidth(380)
+        split.addWidget(self.process_panel)
         split.setChildrenCollapsible(False)
         split.setSizes([650, 520])
         layout.addWidget(split, 1)
@@ -293,171 +303,136 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 16, 0, 0)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
         controls = QHBoxLayout()
         self.scan_mode = QComboBox()
         self.scan_mode.addItem('文件夹扫描', 'folder')
         if system.HAS_DISK_SCAN:
-            self.scan_mode.addItem('磁盘扫描', 'disk')
+            self.scan_mode.addItem('多磁盘扫描', 'disk')
         self.scan_mode.setVisible(system.HAS_DISK_SCAN)
         controls.addWidget(self.scan_mode)
         self.target_inputs = QStackedWidget()
-        folder_controls = QWidget()
-        folder_layout = QHBoxLayout(folder_controls)
+        folder = QWidget()
+        folder_layout = QHBoxLayout(folder)
         folder_layout.setContentsMargins(0, 0, 0, 0)
         self.root_edit = FocusEdit()
-        self.root_edit.setReadOnly(True)
-        self.root_edit.setPlaceholderText('选择文件夹')
+        self.root_edit.setPlaceholderText('输入文件夹路径，例如 /tmp、/var 或 /mnt 下的目录' if system.NAME == 'Linux' else '输入文件夹完整路径')
         folder_layout.addWidget(self.root_edit, 1)
-        self.choose_button = button('选择文件夹', self.choose_directory, True)
+        self.choose_button = button('浏览文件夹', self.choose_directory)
+        self.path_scan_button = button('扫描路径', self.scan_path, True)
         folder_layout.addWidget(self.choose_button)
-        self.target_inputs.addWidget(folder_controls)
-        disk_controls = QWidget()
-        disk_layout = QHBoxLayout(disk_controls)
+        folder_layout.addWidget(self.path_scan_button)
+        self.root_edit.returnPressed.connect(self.scan_path)
+        self.target_inputs.addWidget(folder)
+        disk = QWidget()
+        disk_layout = QHBoxLayout(disk)
         disk_layout.setContentsMargins(0, 0, 0, 0)
-        self.drive_combo = QComboBox()
-        self.drive_combo.setPlaceholderText('选择要扫描的盘符')
-        self.drive_combo.setEnabled(False)
-        disk_layout.addWidget(self.drive_combo, 1)
-        self.disk_button = button('扫描磁盘', self.scan_disk, True)
+        self.drive_picker = QToolButton()
+        self.drive_picker.setText('选择磁盘（可多选）')
+        self.drive_picker.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.disk_menu = QMenu(self.drive_picker)
+        self.drive_picker.setMenu(self.disk_menu)
+        self.disk_menu.aboutToShow.connect(self.refresh_disks)
+        disk_layout.addWidget(self.drive_picker, 1)
+        self.disk_button = button('扫描所选磁盘', self.scan_disk, True)
         self.disk_button.setEnabled(False)
         disk_layout.addWidget(self.disk_button)
-        self.target_inputs.addWidget(disk_controls)
+        self.target_inputs.addWidget(disk)
         controls.addWidget(self.target_inputs, 1)
         self.scan_mode.currentIndexChanged.connect(self.change_scan_mode)
         self.refresh_button = button('重新扫描', self.resume_scan)
-        self.stop_button = button('停止监测', self.stop_directory)
+        self.stop_button = button('停止扫描', self.stop_directory)
         self.refresh_button.setEnabled(False)
         self.stop_button.setEnabled(False)
-        for item in (self.refresh_button, self.stop_button):
-            controls.addWidget(item)
+        controls.addWidget(self.refresh_button)
+        controls.addWidget(self.stop_button)
         layout.addLayout(controls)
         cards = QHBoxLayout()
-        # 文件大小为逻辑大小；分区可用空间由系统统计，包含其他应用活动的影响。
-        self.file_count_card = Metric('已扫描文件')
-        self.file_size_card = Metric('文件逻辑大小')
-        self.file_delta_card = Metric('本轮增量')
-        self.disk_card = Metric('磁盘可用空间')
-        for card in (self.file_count_card, self.file_size_card, self.file_delta_card, self.disk_card):
-            cards.addWidget(card)
+        self.file_count_card = ScanMetric('已扫描文件')
+        self.file_size_card = ScanMetric('文件总大小')
+        self.target_card = ScanMetric('完成目标')
+        self.disk_card = ScanMetric('可用空间')
+        for card in (self.file_count_card, self.file_size_card, self.target_card, self.disk_card):
+            cards.addWidget(card, 1)
         layout.addLayout(cards)
-        self.scan_note = label('尚未开始扫描', 'muted')
-        self.scan_note.setWordWrap(True)
-        layout.addWidget(self.scan_note)
+        status_row = QHBoxLayout()
+        self.scan_note = label('尚未扫描', 'muted')
+        self.scan_note.setTextFormat(Qt.TextFormat.PlainText)
+        status_row.addWidget(self.scan_note, 1)
+        self.scan_details_button = QToolButton()
+        self.scan_details_button.setText('扫描详情')
+        self.scan_details_button.setAutoRaise(True)
+        self.scan_details_button.clicked.connect(self.show_scan_details)
+        self.scan_details_button.hide()
+        status_row.addWidget(self.scan_details_button)
+        layout.addLayout(status_row)
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
         self.progress.setTextVisible(False)
         self.progress.hide()
         layout.addWidget(self.progress)
-        result_header = QHBoxLayout()
-        self.results_title = label('扫描结果', 'section')
-        result_header.addWidget(self.results_title)
+        self.file_mode = QTabBar()
+        for title in ('分类清理', '大文件清理', '重复文件清理', '空间矩阵分析'):
+            self.file_mode.addTab(title)
+        self.file_mode.setExpanding(False)
+        layout.addWidget(self.file_mode)
+        scope = QHBoxLayout()
+        self.source_combo = QComboBox()
+        self.source_combo.addItem('全部扫描目标', None)
+        self.source_combo.setMinimumWidth(180)
+        scope.addWidget(self.source_combo)
         self.file_path = FocusEdit()
-        self.file_path.setObjectName('filePath')
         self.file_path.setReadOnly(True)
-        self.file_path.setPlaceholderText('完整路径')
-        result_header.addWidget(self.file_path, 1)
-        self.usage_button = button('空间分析', lambda: self.open_storage('usage'))
-        self.duplicate_button = button('识别重复', lambda: self.open_storage('duplicates'))
-        self.usage_button.setEnabled(False)
-        self.duplicate_button.setEnabled(False)
-        result_header.addWidget(self.usage_button)
-        result_header.addWidget(self.duplicate_button)
-        layout.addLayout(result_header)
-        filters = QHBoxLayout()
-        self.file_mode = QListWidget()
-        self.file_mode.setObjectName('fileModes')
-        self.file_mode.setFixedWidth(152)
-        self.file_mode.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        for text, mode in [('目录层级', 'tree'), ('大文件', 'large'), ('最近增长', 'growth'), ('空间占用矩阵', 'map')]:
-            item = QListWidgetItem(text)
-            item.setData(Qt.ItemDataRole.UserRole, mode)
-            self.file_mode.addItem(item)
-        self.file_mode.setCurrentRow(0)
-        self.file_order = QComboBox()
-        self.file_order.addItem('按占用排序', 'size')
-        self.file_order.addItem('按增长排序', 'growth')
-        self.file_minimum = QComboBox()
-        for megabytes in (1, 10, 50, 100, 500):
-            self.file_minimum.addItem(f'≥ {megabytes} MB', megabytes * 1024 * 1024)
-        self.file_minimum.setCurrentIndex(2)
-        self.file_minimum.setEnabled(False)
-        self.file_minimum.hide()
-        self.file_search = FocusEdit()
-        self.file_search.setPlaceholderText('搜索文件名或路径，按回车')
-        self.file_search.setClearButtonEnabled(True)
-        for widget in (self.file_order, self.file_minimum, self.file_search):
-            filters.addWidget(widget, 1 if widget is self.file_search else 0)
-        layout.addLayout(filters)
-        self.file_tree = QTreeView()
-        self.file_model = FileModel(self)
-        self.file_tree.setModel(self.file_model)
-        self.file_tree.setItemDelegate(CachedDelegate(self.file_tree))
-        self.file_tree.setUniformRowHeights(True)
-        self.file_tree.setAnimated(True)
-        enable_pixel_scroll(self.file_tree)
-        self.file_tree.setIndentation(22)
-        self.file_tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
-        self.file_tree.setAlternatingRowColors(True)
-        self.file_tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.file_tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.file_tree.header().setStretchLastSection(False)
-        self.file_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column, width in [(1, 190), (2, 75), (3, 115), (4, 90), (5, 145)]:
-            self.file_tree.setColumnWidth(column, width)
-        self.file_tree.setItemDelegateForColumn(1, SizeDelegate(self.file_tree))
-        self.file_tree.selectionModel().currentChanged.connect(self.show_file_path)
-        self.file_model.dataChanged.connect(self.update_selection)
-        self.file_mode.currentRowChanged.connect(self.render_files)
-        self.file_order.currentIndexChanged.connect(self.render_files)
-        self.file_minimum.currentIndexChanged.connect(self.render_files)
-        self.file_search.returnPressed.connect(self.render_files)
-        self.file_search.textChanged.connect(lambda text: self.render_files() if not text else None)
-        self.results_stack = QStackedWidget()
-        self.results_stack.addWidget(self.file_tree)
-        empty_page = QWidget()
-        empty_layout = QVBoxLayout(empty_page)
-        empty_layout.addStretch()
-        self.empty_title = label('选择扫描目标', 'section')
-        self.empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        empty_layout.addWidget(self.empty_title)
-        empty_layout.addStretch()
-        self.results_stack.addWidget(empty_page)
-        self.map_page = MapPage()
+        self.file_path.setObjectName('filePath')
+        self.file_path.setPlaceholderText('文件完整路径 / 扫描范围')
+        scope.addWidget(self.file_path, 1)
+        layout.addLayout(scope)
+        self.cleanup_page = CleanupPage(self)
+        self.large_page = LargeFilesPage(self)
+        self.duplicate_page = DuplicatePage(self)
+        self.map_page = MapPage(self)
         self.map_page.map.file_clicked.connect(self.show_map_file)
-        self.results_stack.addWidget(self.map_page)
-        self.results_stack.setCurrentIndex(1)
-        result_body = QHBoxLayout()
-        result_body.setSpacing(14)
-        result_body.addWidget(self.file_mode)
-        result_content = QVBoxLayout()
-        result_content.addWidget(self.results_stack, 1)
-        details = QHBoxLayout()
-        self.file_view_note = label('', 'muted')
-        details.addWidget(self.file_view_note, 1)
-        self.more_button = button('加载更多', self.load_more_files)
-        self.more_button.setToolTip('加载当前层的下一批文件')
-        self.more_button.setEnabled(False)
-        details.addWidget(self.more_button)
-        result_content.addLayout(details)
-        result_body.addLayout(result_content, 1)
-        layout.addLayout(result_body, 1)
-        self.selection_note = label('未选择文件', 'muted')
+        self.file_workspace = QStackedWidget()
+        for content in (self.cleanup_page, self.large_page, self.duplicate_page, self.map_page):
+            self.file_workspace.addWidget(content)
+        layout.addWidget(self.file_workspace, 1)
         self.last_operation = label('', 'muted')
         self.last_operation.setWordWrap(True)
         self.last_operation.hide()
         layout.addWidget(self.last_operation)
         actions = QHBoxLayout()
+        self.selection_note = label('未选择文件', 'muted')
         actions.addWidget(self.selection_note, 1)
         self.report_button = button('查看清理报告', self.show_report)
         self.report_button.setEnabled(False)
         actions.addWidget(self.report_button)
         self.preview_button = button('预览选中文件', self.preview_selected, True)
-        # 清理仅移入回收站，预览和执行前分别核验文件身份。
         self.preview_button.setEnabled(False)
         actions.addWidget(self.preview_button)
         layout.addLayout(actions)
-        self.tabs.addTab(page, '02  文件增长与清理')
+        for content in (self.cleanup_page, self.large_page, self.duplicate_page):
+            content.checkedChanged.connect(self.update_selection)
+            content.tree.aiRequested.connect(self.show_file_ai)
+        self.file_mode.currentChanged.connect(self.change_file_tool)
+        self.source_combo.currentIndexChanged.connect(self.change_scope)
+        self.large_page.filterChanged.connect(self.update_selection)
+        self.duplicate_page.startRequested.connect(self.start_duplicates)
+        self.duplicate_page.stopRequested.connect(self.stop_content)
+        self.duplicate_page.minimum.currentIndexChanged.connect(self.change_duplicate_options)
+        self.tabs.addTab(page, '02  清理与空间')
+
+    def show_file_ai(self, index):
+        if self.closing or not index.isValid():
+            return
+        model = index.model()
+        number, _ = model.location(index)
+        group, record = model.groups[number], model.record_at(index)
+        protected = (record_key(record) in model._blocked if record is not None else
+                     any(record_key(item) in model._blocked for item in group.records))
+        summary = summarize_cleanup(group, record, platform=system.NAME,
+                                    complete=bool(self.current_snapshot and self.current_snapshot.complete),
+                                    read_only=protected)
+        self.file_ai_dialog.show_summary(summary)
 
     def run_job(self, action, success, failure, finished=None, *, pool=None):
         if self.closing:
@@ -490,7 +465,7 @@ class MainWindow(QMainWindow):
         if self.pages.currentWidget() is self.tabs and self.tabs.currentIndex() == 0:
             self.render_memory()
         updated_at = datetime.fromtimestamp(snapshot.timestamp).strftime('%H:%M:%S')
-        self.statusBar().showMessage(f'更新 {updated_at} · {"监测中" if self.monitoring else "就绪"}')
+        self.statusBar().showMessage(f'更新 {updated_at} · {"扫描中" if self.scan_busy else "就绪"}')
         if self.demo_process and self.demo_process.poll() is not None:
             self.demo_process = None
             self.demo_button.setText('体验演示')
@@ -576,348 +551,407 @@ class MainWindow(QMainWindow):
         self.process_panel.set_reading(process)
 
     def choose_directory(self):
-        path = QFileDialog.getExistingDirectory(self, '选择文件夹', str(self.root or Path.home()))
+        initial = self.root or ('/' if system.NAME == 'Linux' else Path.home())
+        path = QFileDialog.getExistingDirectory(self, '选择任意可访问文件夹', str(initial))
         if path:
+            self.root_edit.setText(path)
             self.start_directory(Path(path))
+
+    def scan_path(self):
+        text = self.root_edit.text().strip()
+        if text:
+            self.start_directory(Path(text).expanduser())
+        else:
+            self.set_operation('请先输入或浏览选择文件夹。')
 
     def change_scan_mode(self, index):
         self.target_inputs.setCurrentIndex(index)
         if self.scan_mode.currentData() == 'disk':
-            selected = self.drive_combo.currentData()
-            self.drive_combo.clear()
-            try:
-                for root in system.list_disks():
-                    self.drive_combo.addItem(str(root), str(root))
-                self.drive_combo.setToolTip('扫描整个磁盘')
-            except OSError as error:
-                self.drive_combo.setToolTip(f'无法读取磁盘列表：{error}')
-            if selected is not None:
-                match = self.drive_combo.findData(selected)
-                if match >= 0:
-                    self.drive_combo.setCurrentIndex(match)
-            if self.drive_combo.currentIndex() < 0 and self.drive_combo.count():
-                self.drive_combo.setCurrentIndex(0)
-            available = self.drive_combo.count() > 0 and not self.cleanup_busy
-            self.drive_combo.setEnabled(available)
-            self.disk_button.setEnabled(available)
-            if not self.drive_combo.count():
-                self.drive_combo.setPlaceholderText('当前没有可选磁盘')
+            self.refresh_disks()
+
+    def refresh_disks(self):
+        self.disk_menu.clear()
+        try:
+            roots = tuple(system.list_disks())
+        except OSError as error:
+            roots = ()
+            self.drive_picker.setToolTip(str(error))
+        available = {str(root) for root in roots}
+        self.selected_disks.intersection_update(available)
+        for root in roots:
+            action = self.disk_menu.addAction(str(root))
+            action.setCheckable(True)
+            action.setChecked(str(root) in self.selected_disks)
+            action.toggled.connect(lambda checked, root=str(root): self.select_disk(root, checked))
+        self.update_disk_choice()
+
+    def select_disk(self, root, checked):
+        if checked:
+            self.selected_disks.add(root)
+        else:
+            self.selected_disks.discard(root)
+        self.update_disk_choice()
+
+    def update_disk_choice(self):
+        self.drive_picker.setText('、'.join(sorted(self.selected_disks)) or '选择磁盘（可多选）')
+        self.disk_button.setEnabled(bool(self.selected_disks) and not self.cleanup_busy)
 
     def scan_disk(self):
-        root = self.drive_combo.currentData()
-        if root is not None:
-            self._start_scan(Path(root), 'disk')
+        if self.selected_disks:
+            self._start_scan_roots(tuple(Path(root) for root in sorted(self.selected_disks)), 'disk')
 
     def start_directory(self, root):
-        self._start_scan(root, 'folder')
+        self._start_scan_roots((root,), 'folder')
 
-    def _start_scan(self, root, kind):
+    def _start_scan_roots(self, roots, kind):
         if self.cleanup_busy:
             return
-        try:
-            root = validate_plain_path(root)
-            if not root.is_dir():
-                raise ValueError('请选择目录')
-            if kind == 'folder' and root.parent == root:
-                raise ValueError('整盘扫描请使用“磁盘扫描”，并选择对应盘符。' if system.HAS_DISK_SCAN
-                                 else '请选择具体文件夹，例如 /home；不支持扫描整个根文件系统。')
-            if kind == 'disk' and root.parent != root:
-                raise ValueError('请选择磁盘根目录')
-        except (OSError, ValueError) as error:
-            QMessageBox.warning(self, '无法监测目录', str(error))
+        roots = tuple(dict.fromkeys(Path(os.path.abspath(Path(root).expanduser())) for root in roots))
+        if not roots:
             return
-        for dialog in self.findChildren(StorageDialog):
-            dialog.close()
+        if kind == 'folder' and any(root.parent == root for root in roots):
+            QMessageBox.warning(self, '请选择具体文件夹',
+                '整盘扫描请选择磁盘。' if system.HAS_DISK_SCAN else '可扫描 /tmp、/var、/mnt 等具体目录；不扫描整个根文件系统 /。')
+            return
         self.stop_directory()
-        self.root = root
-        self.scan_kind = kind
-        self.scan_mode.setCurrentIndex(1 if kind == 'disk' else 0)
+        self.roots, self.root, self.scan_kind = roots, roots[0], kind
         if kind == 'folder':
-            self.root_edit.setText(str(root))
-        self.results_title.setText('磁盘扫描结果' if kind == 'disk' else '文件夹扫描结果')
-        self.file_path.setText(str(root))
-        self.current_snapshot = self.comparison_snapshot = None
-        self.file_changes = []
-        self.file_analysis = None
-        self.file_view_key = None
-        self.scan_progress = None
-        self.scan_pending = False
-        for card in (self.file_count_card, self.file_size_card, self.file_delta_card, self.disk_card):
-            card.value.setText('—')
-        filters = (self.file_mode, self.file_order, self.file_minimum, self.file_search)
-        for widget in filters:
-            widget.blockSignals(True)
-        self.file_mode.setCurrentRow(0)
-        self.file_order.setCurrentIndex(0)
-        self.file_minimum.setCurrentIndex(2)
-        self.file_search.clear()
-        for widget in filters:
-            widget.blockSignals(False)
-        self.render_files()
-        self.file_view_note.setText('')
-        self.empty_title.setText('正在扫描磁盘…' if kind == 'disk' else '正在扫描文件夹…')
+            self.root_edit.setText(str(roots[0]))
+        self.current_snapshot = self.batch_analysis = None
+        self.duplicate_key = self.duplicate_result = self.matrix_key = None
+        self.cleanup_page.set_analysis(None)
+        self.large_page.set_records(())
+        self.duplicate_page.set_result(None)
+        self.map_page.set_analysis(None)
+        self.source_combo.blockSignals(True)
+        self.source_combo.clear()
+        self.source_combo.addItem('全部扫描目标', None)
+        self.source_combo.blockSignals(False)
+        self.file_mode.setCurrentIndex(0)
+        self.file_path.setText('；'.join(map(str, roots)))
         self.set_operation('')
-        self.scan_note.setToolTip('')
-        self.scan_note.setText('正在切换扫描目标…' if self.scan_busy else '正在扫描…')
-        self.progress.show()
-        self.monitoring = True
-        self.directory_watch = system.DirectoryWatch(root)
-        self.file_timer.start()
-        self.stop_button.setEnabled(True)
-        self.refresh_button.setEnabled(True)
+        for card in (self.file_count_card, self.file_size_card, self.target_card, self.disk_card):
+            card.set_value('—')
         self.request_scan()
 
+    def request_scan(self):
+        if not self.roots or self.cleanup_busy or self.closing:
+            return
+        self.scan_cancel.set()
+        self.scan_generation += 1
+        generation, roots = self.scan_generation, self.roots
+        cancel = threading.Event()
+        self.scan_cancel = cancel
+        self.scan_busy = True
+        self.scan_started_at = time.monotonic()
+        self.scan_progress = {}
+        self.set_scan_status('正在扫描…')
+        for card in (self.file_count_card, self.file_size_card, self.target_card, self.disk_card):
+            card.set_value('—')
+        self.progress.show()
+        self.stop_button.setEnabled(True)
+        self.refresh_button.setEnabled(False)
+        self.file_timer.start()
+        self.stop_content()
+
+        def scan():
+            def report(root, info):
+                if generation == self.scan_generation:
+                    self.scan_progress[str(root)] = info
+            batch = scan_batch(roots, cancel, report)
+            return None if cancel.is_set() else analyze_batch(batch, cancel)
+
+        def failed(error):
+            if generation == self.scan_generation:
+                self.set_scan_status('扫描失败', str(error))
+
+        def finished():
+            if generation == self.scan_generation:
+                self.scan_busy = False
+                self.progress.hide()
+                self.stop_button.setEnabled(False)
+                self.refresh_button.setEnabled(True)
+                self.file_timer.stop()
+                self.update_selection()
+
+        self.run_job(scan, lambda result: self.accept_scan(generation, result), failed, finished, pool=self.scan_pool)
+
+    def accept_scan(self, generation, result):
+        if self.closing or generation != self.scan_generation or result is None or self.cleanup_busy:
+            return
+        self.batch_analysis, self.current_snapshot = result, result.snapshot
+        batch = result.snapshot
+        self.duplicate_key = self.duplicate_result = self.matrix_key = None
+        self.duplicate_page.set_result(None)
+        selected = self.source_combo.currentData()
+        self.source_combo.blockSignals(True)
+        self.source_combo.clear()
+        self.source_combo.addItem('全部扫描目标', None)
+        for root in batch.roots:
+            self.source_combo.addItem(str(root), str(root))
+        match = self.source_combo.findData(selected)
+        self.source_combo.setCurrentIndex(max(0, match))
+        self.source_combo.blockSignals(False)
+        self.render_scan_metrics(batch)
+        quality = '扫描完成' if batch.complete else '部分完成'
+        details = (f'{quality}\n扫描文件：{len(batch.files):,}\n文件逻辑大小：{format_size(batch.total_bytes)}'
+                   f'\n完成目标：{len(batch.snapshots)} / {len(self.roots)}\n跳过：{batch.skipped:,} 项'
+                   f'\n耗时：{time.monotonic()-self.scan_started_at:.1f} 秒'
+                   '\n可用空间已按磁盘去重。\n\n' + '\n'.join(batch.errors))
+        self.set_scan_status(quality, details.strip())
+        self.render_files()
+
+    def render_scan_metrics(self, batch):
+        self.file_count_card.set_value(f'{len(batch.files):,}', '个')
+        self.file_size_card.set_value(format_size(batch.total_bytes))
+        self.target_card.set_value(str(len(batch.snapshots)), f'/ {len(self.roots)}')
+        self.disk_card.set_value(format_size(batch.free_bytes))
+
+    def set_scan_status(self, text, details=''):
+        self.scan_note.setText(text)
+        self.scan_note.setToolTip(details)
+        self.scan_details_button.setVisible(bool(details))
+
+    def show_scan_details(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle('扫描详情')
+        dialog.resize(640, 420)
+        layout = QVBoxLayout(dialog)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(self.scan_note.toolTip() or self.scan_note.text())
+        layout.addWidget(text)
+        layout.addWidget(button('关闭', dialog.close))
+        dialog.exec()
+        dialog.deleteLater()
+
+    def poll_scan(self):
+        if self.scan_busy:
+            info = tuple(self.scan_progress.items())
+            total = sum(item.files for _, item in info)
+            paths = ' · '.join(f'{root}：{item.stage} {item.files:,} 文件' for root, item in info)
+            self.file_count_card.set_value(f'{total:,}', '个')
+            completed = sum(item.stage == '扫描完成' for _, item in info)
+            self.target_card.set_value(str(completed), f'/ {len(self.roots)}')
+            self.set_scan_status('正在扫描…', f'已枚举 {total:,} 个文件 · {time.monotonic()-self.scan_started_at:.1f}秒\n{paths}')
+        if hasattr(self, 'content_progress') and self.content_progress and self.duplicate_page.busy:
+            self.duplicate_page.set_progress(*self.content_progress)
+
     def stop_directory(self):
-        self.monitoring = False
         self.scan_generation += 1
         self.scan_cancel.set()
-        if self.directory_watch is not None:
-            self.directory_watch.close()
-            self.directory_watch = None
+        self.scan_busy = False
+        self.stop_content()
         if hasattr(self, 'file_timer'):
             self.file_timer.stop()
         if hasattr(self, 'stop_button'):
             self.stop_button.setEnabled(False)
-            self.scan_note.setText('监测已停止' if self.current_snapshot
-                                   else '扫描已停止')
-            if self.current_snapshot is None:
-                self.file_view_note.setText('')
-                self.empty_title.setText('扫描已停止')
-        if hasattr(self, 'progress'):
+            self.refresh_button.setEnabled(bool(self.roots))
             self.progress.hide()
+            self.scan_note.setText('扫描已停止')
+            if self.current_snapshot is not None and not self.closing:
+                self.render_scan_metrics(self.current_snapshot)
+        self.update_selection()
 
     def resume_scan(self):
-        if not self.root or self.cleanup_busy:
-            return
-        self.monitoring = True
-        if self.directory_watch is None:
-            self.directory_watch = system.DirectoryWatch(self.root)
-        self.file_timer.start()
-        self.stop_button.setEnabled(True)
         self.request_scan()
 
-    def poll_directory(self):
-        if self.scan_busy and self.scan_progress is not None:
-            generation, info = self.scan_progress
-            if generation == self.scan_generation and self.monitoring:
-                elapsed = time.monotonic() - self.scan_started_at
-                self.scan_note.setText(f'{info.stage} · {info.files:,} 文件 / {info.directories:,} 目录 · {elapsed:.1f}秒')
-        if not self.monitoring or self.scan_busy or self.cleanup_busy:
-            return
-        changed = self.directory_watch.changed() if self.directory_watch else None
-        self.scan_pending = self.scan_pending or bool(changed)
-        # 变化通知避免空闲时重复扫描，定时扫描用于补偿遗漏的通知。
-        interval = 30 if changed is None else 300
-        since_scan = time.monotonic() - self.last_scan_time
-        min_interval = 30 if self.root is not None and self.root.parent == self.root else 0
-        if (self.scan_pending and since_scan >= min_interval) or since_scan >= interval:
-            self.request_scan()
+    def stop_content(self):
+        self.content_generation += 1
+        self.content_cancel.set()
+        self.content_progress = None
+        self.matrix_key = None
+        if hasattr(self, 'duplicate_page'):
+            was_busy = self.duplicate_page.busy
+            self.duplicate_page.set_busy(False)
+            if was_busy:
+                self.duplicate_page.status.setText('内容比对已停止，不使用未完成的结果。')
 
-    def request_scan(self):
-        if self.closing or not self.monitoring or self.scan_busy or self.cleanup_busy or not self.root:
-            return
-        self.scan_busy = True
-        generation, root = self.scan_generation, self.root
-        previous = self.comparison_snapshot
-        self.scan_started_at = time.monotonic()
-        self.scan_progress = None
-        self.scan_pending = False
-        cancel = threading.Event()
-        self.scan_cancel = cancel
-        self.progress.show()
-        self.scan_note.setText('正在扫描…')
-        if self.current_snapshot is None:
-            self.results_stack.setCurrentIndex(1)
-            self.empty_title.setText('正在扫描磁盘…' if self.scan_kind == 'disk' else '正在扫描文件夹…')
+    def clear_file_selection(self):
+        for page in (self.cleanup_page, self.large_page, self.duplicate_page):
+            page.clear_selection()
 
-        def failed(error):
-            if generation == self.scan_generation:
-                state = '保留上次结果' if self.current_snapshot else '本次尚无结果'
-                self.scan_note.setText(f'本轮扫描失败，{state}：{error}')
-                if self.current_snapshot is None:
-                    self.file_view_note.setText('扫描失败，请检查目录访问权限或重试。')
-                    self.empty_title.setText('扫描未完成')
-
-        def finished():
-            self.scan_busy = False
-            if generation == self.scan_generation:
-                self.last_scan_time = time.monotonic()
-            if not self.closing:
-                self.progress.hide()
-                if self.monitoring and generation != self.scan_generation:
-                    QTimer.singleShot(0, self.request_scan)
-
-        def scan():
-            def report(info):
-                self.scan_progress = (generation, info)
-            snapshot = scan_directory(root, cancel, progress=report)
-            return None if snapshot.cancelled else analyze_files(previous, snapshot, cancel=cancel, progress=report)
-
-        self.run_job(scan, lambda result: self.accept_scan(generation, result), failed, finished)
-
-    def accept_scan(self, generation, result):
-        if self.closing or generation != self.scan_generation or not self.monitoring or result is None or self.cleanup_busy:
-            return
-        snapshot = result.snapshot
-        if self.current_snapshot is None and self.scan_kind == 'disk':
-            self.file_mode.blockSignals(True)
-            self.file_mode.setCurrentRow(3)
-            self.file_mode.blockSignals(False)
-        self.file_analysis = result
-        self.file_changes = result.changes
-        self.current_snapshot = snapshot
-        self.comparison_snapshot = result.comparison
-        self.file_count_card.value.setText(f'{len(snapshot.files):,}')
-        self.file_size_card.value.setText(format_size(snapshot.total_bytes))
-        delta = result.directories[''].delta
-        self.file_delta_card.value.setText(format_size(delta, True) if result.comparable else '统计不完整')
-        self.disk_card.value.setText(format_size(snapshot.free_bytes))
+    def change_file_tool(self, index):
+        self.stop_content()
+        self.clear_file_selection()
+        self.file_workspace.setCurrentIndex(index)
         self.render_files()
-        quality = '完整扫描' if snapshot.complete else f'部分结果 · 跳过 {snapshot.skipped} 项'
-        if snapshot.truncated:
-            quality += ' · 达到本次扫描限制'
-        updated_at = datetime.fromtimestamp(snapshot.timestamp).strftime('%H:%M:%S')
-        # 扫描引擎与自动重扫策略由平台层和 poll_directory 管理，不在界面重复解释。
-        total = time.monotonic() - self.scan_started_at
-        note = f'{quality} · 耗时 {total:.1f}秒 · {updated_at}'
-        self.scan_note.setText(note)
-        self.scan_note.setToolTip('\n'.join(snapshot.errors))
-        self.update_selection()
+
+    def change_scope(self, *_):
+        self.stop_content()
+        self.clear_file_selection()
+        self.duplicate_key = self.duplicate_result = None
+        self.duplicate_page.set_result(None)
+        self.render_files()
+
+    def scoped_batch(self):
+        if self.current_snapshot is None:
+            return None
+        source = self.source_combo.currentData()
+        return self.current_snapshot if source is None else ScanBatch(tuple(
+            snapshot for snapshot in self.current_snapshot.snapshots if str(snapshot.root) == source))
+
+    def scoped_cleanup(self):
+        analysis = self.batch_analysis.cleanup
+        source = self.source_combo.currentData()
+        if source is None:
+            return analysis
+        items = tuple(replace(item, records=[record for record in item.records if str(record.root) == source])
+                      for item in analysis.items)
+        items = tuple(item for item in items if item.records)
+        return CleanupAnalysis(self.scoped_batch(), items, {record_key(record): item for item in items for record in item.records})
 
     def render_files(self, *_):
-        mode = self.file_mode.currentItem().data(Qt.ItemDataRole.UserRole)
-        is_map = mode == 'map'
-        self.file_search.setEnabled(not is_map)
-        self.file_minimum.setEnabled(mode == 'large')
-        self.file_minimum.setVisible(mode == 'large')
-        self.file_order.setEnabled(mode == 'tree' and not self.file_search.text().strip())
-        view_key = (self.root, mode, self.file_minimum.currentData(), self.file_search.text(), self.file_order.currentData())
-        preserve = view_key == self.file_view_key
-        scroll = self.file_tree.verticalScrollBar().value() if preserve else 0
-        expanded = []
-        for key, node in self.file_model.nodes.items():
-            index = node.index()
-            if preserve and self.file_tree.isExpanded(index):
-                expanded.append((key, node.rowCount()))
-        root_rows = self.file_model.rowCount() if preserve else 0
-        self.file_model.set_analysis(self.file_analysis, 'tree' if is_map else mode, self.file_minimum.currentData(),
-                                     '' if is_map else self.file_search.text(), self.file_order.currentData())
-        while self.file_model.rowCount() < root_rows and self.file_model.has_more():
-            self.file_model.load_more()
-        for key, count in sorted(expanded, key=lambda item: item[0].count('/')):
-            node = self.file_model.nodes.get(key)
-            if node:
-                index = node.index()
-                while node.rowCount() < count and self.file_model.has_more(index):
-                    self.file_model.load_more(index)
-                self.file_tree.expand(index)
-        self.file_view_key = view_key
-        self.file_tree.verticalScrollBar().setValue(scroll)
-        self.results_stack.setCurrentIndex(0 if self.file_model.rowCount() else 1)
-        self.map_page.set_analysis(self.file_analysis)
-        if is_map and self.file_analysis is not None:
-            self.results_stack.setCurrentWidget(self.map_page)
-        if self.file_analysis is not None and not self.file_model.rowCount():
-            self.empty_title.setText('暂无匹配结果')
-        self.file_path.setText(str(self.root) if self.root else '')
-        self.file_path.setToolTip(str(self.root) if self.root else '')
-        scope = '结果' if self.file_model.flat else '顶层'
-        note = f'{scope} {self.file_model.rowCount()} / {len(self.file_model.entries)} 项' if self.file_analysis else ''
-        if self.file_model.flat and len(self.file_model.entries) == 500:
-            note += ' · 前500项'
-        self.file_view_note.setText('矩形面积表示本次已扫描文件的逻辑大小' if is_map and self.file_analysis else note)
-        self.more_button.setEnabled(self.file_analysis is not None and not is_map)
-        self.more_button.setVisible(not is_map)
-        self.usage_button.setEnabled(self.current_snapshot is not None and not self.cleanup_busy)
-        self.duplicate_button.setEnabled(self.current_snapshot is not None and not self.cleanup_busy)
+        mode = self.file_mode.currentIndex()
+        self.file_workspace.setCurrentIndex(mode)
+        if self.batch_analysis is None:
+            self.update_selection()
+            return
+        if mode == 0:
+            self.cleanup_page.set_analysis(self.scoped_cleanup())
+        elif mode == 1:
+            self.render_large()
+        elif mode == 2:
+            if self.duplicate_key != self.duplicate_view_key():
+                self.duplicate_page.set_result(None)
+        elif mode == 3:
+            self.request_matrix()
         self.update_selection()
 
-    def show_map_file(self, relative):
-        if self.root is not None:
-            path = str(self.root / relative)
-            self.file_path.setText(path)
-            self.file_path.setToolTip(path)
+    def render_large(self):
+        source = self.source_combo.currentData()
+        records = (record for record in self.batch_analysis.large_records if source is None or str(record.root) == source)
+        self.large_page.set_records(records, self.batch_analysis.cleanup.readonly_records())
 
-    def open_storage(self, mode):
-        if self.current_snapshot is None or self.cleanup_busy or self.closing:
+    def view_key(self):
+        return id(self.batch_analysis), self.source_combo.currentData()
+
+    def duplicate_view_key(self):
+        return self.view_key(), self.duplicate_page.minimum.currentData()
+
+    def change_duplicate_options(self, *_):
+        self.stop_content()
+        self.duplicate_key = self.duplicate_result = None
+        self.duplicate_page.set_result(None)
+        self.update_selection()
+
+    def request_matrix(self):
+        key = self.view_key()
+        if self.matrix_key == key:
             return
-        previous = getattr(self, 'storage_dialog', None)
-        if previous is not None and not previous.closed:
-            previous.close()
-        self.storage_dialog = StorageDialog(self.current_snapshot, mode, self.run_job, self)
-        self.storage_dialog.show()
-        self.storage_dialog.start()
+        self.matrix_key = key
+        generation = self.content_generation
+        cancel = threading.Event()
+        self.content_cancel = cancel
+        batch = self.scoped_batch()
+        self.map_page.set_analysis(None)
+        self.statusBar().showMessage('正在生成空间矩阵…')
 
-    def show_file_path(self, index, *_):
-        if index.isValid():
-            entry = self.file_model.itemFromIndex(index.siblingAtColumn(0)).entry
-            relative = entry.relative
-            if relative.startswith('\0small/'):
-                relative = relative[len('\0small/'):]
-            path = str(self.root / relative)
-            self.file_path.setText(path)
-            self.file_path.setToolTip(path)
+        def accept(result):
+            if not cancel.is_set() and generation == self.content_generation and key == self.view_key() and result is not None:
+                self.map_page.set_analysis(result)
+                self.statusBar().showMessage('空间矩阵就绪')
+        def failed(error):
+            if generation == self.content_generation:
+                self.matrix_key = None
+                self.statusBar().showMessage(f'空间矩阵未完成：{error}')
+        self.run_job(lambda: build_matrix(batch, cancel), accept, failed, pool=self.content_pool)
 
-    def load_more_files(self):
-        index = self.file_tree.currentIndex()
-        if index.isValid():
-            index = index.siblingAtColumn(0)
-            if not self.file_model.hasChildren(index):
-                index = index.parent()
-        if not self.file_model.has_more(index):
-            index = QModelIndex()
-        self.file_model.load_more(index)
+    def start_duplicates(self):
+        if self.current_snapshot is None or self.scan_busy or self.cleanup_busy:
+            return
+        self.stop_content()
+        generation, key = self.content_generation, self.duplicate_view_key()
+        cancel = threading.Event()
+        self.content_cancel = cancel
+        batch = self.scoped_batch()
+        blocked = tuple(self.batch_analysis.cleanup.readonly_records())
+        minimum = self.duplicate_page.minimum.currentData()
+        self.duplicate_page.set_result(None)
+        self.duplicate_page.set_busy(True)
+        self.content_progress = None
+        self.file_timer.start()
+        def progress(stage, done, total):
+            if generation == self.content_generation:
+                self.content_progress = stage, done, total
+        def accept(result):
+            if generation == self.content_generation and not cancel.is_set() and key == self.duplicate_view_key():
+                self.duplicate_result, self.duplicate_key = result, key
+                self.duplicate_page.set_result(result, blocked)
+        def failed(error):
+            if generation == self.content_generation:
+                self.duplicate_page.status.setText(f'内容比对未完成：{error}')
+        def finished():
+            if generation == self.content_generation:
+                self.duplicate_page.set_busy(False)
+                if not self.scan_busy:
+                    self.file_timer.stop()
+        self.run_job(lambda: find_duplicates(batch, cancel, progress, minimum_bytes=minimum), accept, failed, finished, pool=self.content_pool)
+
+    def show_map_file(self, record):
+        self.file_path.setText(str(record.path))
+        self.file_path.setToolTip(str(record.path))
 
     def selected_records(self):
-        return self.file_model.selected_records()
+        index = self.file_mode.currentIndex()
+        return (self.cleanup_page, self.large_page, self.duplicate_page)[index].selected_records() if index < 3 else []
 
     def set_operation(self, message):
         self.last_operation.setText(message)
         self.last_operation.setVisible(bool(message))
 
     def update_selection(self, *_):
+        if not hasattr(self, 'preview_button'):
+            return
         records = self.selected_records()
-        self.selection_note.setText(f'已选 {len(records)} 项 · {format_size(sum(record.size for record in records))}')
-        self.preview_button.setEnabled(bool(records) and not self.cleanup_busy)
+        self.selection_note.setText(f'已选 {len(records)} 个文件 · {format_size(sum(record.size for record in records))}'
+                                    if self.file_mode.currentIndex() < 3 else '')
+        self.preview_button.setEnabled(bool(records) and not self.cleanup_busy and not self.scan_busy)
 
     def set_cleanup_busy(self, busy):
         self.cleanup_busy = busy
-        self.choose_button.setEnabled(not busy)
-        self.scan_mode.setEnabled(not busy)
-        self.drive_combo.setEnabled(not busy and self.drive_combo.count() > 0)
-        self.disk_button.setEnabled(not busy and self.drive_combo.count() > 0)
-        self.refresh_button.setEnabled(bool(self.root) and not busy)
-        self.stop_button.setEnabled(self.monitoring and not busy)
-        self.usage_button.setEnabled(self.current_snapshot is not None and not busy)
-        self.duplicate_button.setEnabled(self.current_snapshot is not None and not busy)
+        for widget in (self.file_mode, self.source_combo, self.file_workspace, self.scan_mode,
+                       self.choose_button, self.path_scan_button, self.root_edit, self.drive_picker):
+            widget.setEnabled(not busy)
+        self.update_disk_choice()
+        self.refresh_button.setEnabled(bool(self.roots) and not busy and not self.scan_busy)
         self.update_selection()
 
     def preview_selected(self):
-        records = self.selected_records()
-        if self.cleanup_busy or not records or not self.root:
+        records = tuple(self.selected_records())
+        if self.cleanup_busy or self.scan_busy or not records or self.current_snapshot is None:
             return
-        self.scan_generation += 1
-        self.scan_cancel.set()
+        classified = self.batch_analysis.cleanup.by_file
+        notes = []
+        for record in records:
+            item = classified.get(record_key(record))
+            if item is not None and item.risk == 'high':
+                self.set_operation(f'不可直接清理：{item.name}。{item.reason}')
+                return
+            name = item.name if item else ('重复文件副本' if self.file_mode.currentIndex() == 2 else '手动选择的大文件')
+            risk = item.risk if item and self.file_mode.currentIndex() == 0 else 'medium'
+            reason = item.reason if item else '请确认文件用途与保留位置，清理后可能影响应用或个人数据。'
+            notes.append((record_key(record), name, risk, reason))
+        batch = self.current_snapshot
+        groups = self.duplicate_result.groups if self.file_mode.currentIndex() == 2 and self.duplicate_result else ()
+        readonly = tuple(self.batch_analysis.cleanup.readonly_records())
         self.set_cleanup_busy(True)
-
         def failed(error):
             self.set_cleanup_busy(False)
-            QMessageBox.warning(self, '预览未通过核验', str(error))
-
-        self.run_job(lambda: prepare_cleanup(self.root, records), self.show_preview, failed)
+            self.set_operation(f'预览未通过核验：{error}')
+        self.run_job(lambda: prepare_batch_cleanup(batch, records, risk_notes=tuple(notes), duplicate_groups=groups, readonly=readonly),
+                     self.show_preview, failed, pool=self.content_pool)
 
     def show_preview(self, plan):
         dialog = PreviewDialog(plan, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             self.set_cleanup_busy(False)
             return
-
         def failed(error):
             self.set_cleanup_busy(False)
             self.set_operation(f'清理未完成：{error}')
-
         self.set_operation('正在移入回收站…')
-        self.run_job(lambda: execute_cleanup(plan), self.accept_cleanup, failed)
+        self.run_job(lambda: execute_batch_cleanup(plan), self.accept_cleanup, failed, pool=self.content_pool)
 
     def accept_cleanup(self, report):
         self.set_cleanup_busy(False)
@@ -925,14 +959,30 @@ class MainWindow(QMainWindow):
         text = f"已移入回收站 {counts['成功']} 项（{format_size(report.recycled_bytes)}）· 跳过 {counts['跳过']} · 失败 {counts['失败']}"
         self.set_operation(text)
         lines = [datetime.now().strftime('%Y-%m-%d %H:%M:%S'), text,
-                 '移入回收站的大小为文件逻辑大小，非实际空间收益。']
-        if report.before_free is not None and report.after_free is not None:
-            lines.append('所在分区可用空间变化（全局）：' + format_size(report.after_free - report.before_free, True))
+                 '大小为文件逻辑大小，非立即释放的磁盘空间。']
         lines.extend(f'[{result.state}] {result.record.path}\n  {result.message}' for result in report.results)
         self.reports.append('\n'.join(lines))
         self.report_button.setEnabled(True)
-        if self.monitoring:
-            self.request_scan()
+        self.clear_file_selection()
+        self.duplicate_result = self.duplicate_key = None
+        self.duplicate_page.set_result(None)
+        # 从已有快照移除已处理记录，再在后台整理索引；无需清理后再遍历整盘。
+        excluded = {record_key(result.record) for result in report.results if result.state in ('成功', '跳过')}
+        old = self.current_snapshot
+        snapshots = tuple(replace(snapshot, files={key: record for key, record in snapshot.files.items()
+                          if record_key(record) not in excluded}) for snapshot in old.snapshots)
+        batch = ScanBatch(snapshots, old.errors, old.elapsed)
+        generation = self.scan_generation
+        self.set_cleanup_busy(True)
+        def updated(result):
+            if generation == self.scan_generation and result is not None:
+                self.set_cleanup_busy(False)
+                self.accept_scan(generation, result)
+                self.scan_note.setText('清理结果已更新')
+        def failed(error):
+            self.set_cleanup_busy(False)
+            self.set_operation(text + f' · 统计更新失败：{error}，请重新扫描。')
+        self.run_job(lambda: analyze_batch(batch), updated, failed, pool=self.content_pool)
 
     def show_report(self):
         if not self.reports:
@@ -969,10 +1019,9 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.closing = True
         self.ai_settings.shutdown()
+        self.file_ai_dialog.shutdown()
         self.process_panel.shutdown()
         self.process_icons.shutdown()
-        for dialog in self.findChildren(StorageDialog):
-            dialog.close()
         self.apps_page.shutdown()
         self.memory_timer.stop()
         self.stop_directory()

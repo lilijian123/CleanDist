@@ -5,7 +5,7 @@ import os
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer
 from PySide6.QtGui import QIcon, QPixmap
-from PySide6.QtWidgets import QComboBox, QFrame, QGridLayout, QHBoxLayout, QMessageBox, QStyle, QTabWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QComboBox, QDialog, QFrame, QGridLayout, QHBoxLayout, QMessageBox, QSizePolicy, QStyle, QVBoxLayout, QWidget
 
 from ..platforms import system
 from ..core.processes import cpu_percentage, sample_process_details, summarize_memory
@@ -41,12 +41,23 @@ class ProcessPanel(QWidget):
         layout.addLayout(header)
         self.operation = label('', 'muted')
         self.operation.setWordWrap(True)
+        self.operation.hide()
         layout.addWidget(self.operation)
-        self.details_tabs = QTabWidget()
-        layout.addWidget(self.details_tabs)
-        overview = QWidget()
-        self.details_tabs.addTab(overview, '概览')
-        layout = QVBoxLayout(overview)
+        self.quick_summary = label('选择进程后显示关键指标', 'muted')
+        self.quick_summary.setWordWrap(True)
+        layout.addWidget(self.quick_summary)
+        actions = QHBoxLayout()
+        self.details_button = button('进程详情 ▸', self.show_details)
+        self.resource_button = button('资源明细 / 趋势 / 依据 ▸', self.show_resources)
+        actions.addWidget(self.details_button)
+        actions.addWidget(self.resource_button)
+        actions.addStretch()
+        main_layout = layout
+        self.details_dialog = QDialog(self)
+        self.details_dialog.setWindowTitle('进程详情')
+        self.details_dialog.resize(720, 650)
+        self.details_dialog.setSizeGripEnabled(True)
+        layout = QVBoxLayout(self.details_dialog)
         layout.setContentsMargins(0, 10, 0, 0)
         layout.setSpacing(12)
         information = QGridLayout()
@@ -58,6 +69,8 @@ class ProcessPanel(QWidget):
             information.addWidget(label(caption, 'muted'), row, 0)
             value = label('不可用')
             value.setWordWrap(True)
+            value.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            value.setMaximumHeight(44)
             value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             self.fields[key] = value
             information.addWidget(value, row, 1)
@@ -89,7 +102,8 @@ class ProcessPanel(QWidget):
         layout.addLayout(line)
         self.chart = TrendChart()
         self.chart.relative = True
-        layout.addWidget(self.chart)
+        self.chart.setMinimumHeight(110)
+        layout.addWidget(self.chart, 1)
         self.summary = label('', 'muted')
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
@@ -98,7 +112,25 @@ class ProcessPanel(QWidget):
         layout.addWidget(self.note)
         layout.addStretch()
         self.analysis = AnalysisPane(run_job, fast_job=fast_job)
-        self.details_tabs.addTab(self.analysis, '资源分析')
+        main_layout.addWidget(self.analysis, 1)
+        main_layout.addLayout(actions)
+
+    def open_ai(self):
+        if not self.closed and self.key:
+            self.analysis.ai.analyze_button.setFocus()
+            self.analysis.request_sample()
+
+    def show_details(self):
+        self.details_dialog.show()
+        self.details_dialog.raise_()
+        self.request_details()
+
+    def show_resources(self):
+        self.analysis.show_details()
+
+    def hideEvent(self, event):
+        self.details_dialog.hide()
+        super().hideEvent(event)
 
     def change_chart(self, *_):
         self.chart.relative = bool(self.chart_mode.currentData())
@@ -119,11 +151,15 @@ class ProcessPanel(QWidget):
             self.key, self.details = key, None
             self.update_stop_buttons()
             self.operation.clear()
+            self.operation.hide()
             for field in self.fields.values():
                 field.setText('不可用')
         self.chart.points = reading.points if reading else ()
         self.chart.update()
         self.title.setText(reading.name if reading else '选择进程查看详情')
+        self.details_dialog.setWindowTitle(f'进程详情 · {reading.name} · PID {key[0]}' if reading else '进程详情')
+        self.quick_summary.setText(f'PID {key[0]} · RSS {format_size(reading.rss)} · 窗口变化 {format_size(reading.delta, True)}'
+                                   if reading else '选择进程后显示关键指标')
         stats = summarize_memory(reading.points) if reading else None
         for name, value in self.metrics.items():
             number = getattr(stats, name) if stats else None
@@ -155,6 +191,7 @@ class ProcessPanel(QWidget):
             percent = cpu_percentage(self.details, details)
             self.details = details
             self.fields['path'].setText(details.path or '不可用')
+            self.fields['path'].setToolTip(details.path or '不可用')
             if details.started_at is not None:
                 self.fields['started'].setText(datetime.fromtimestamp(details.started_at).strftime('%Y-%m-%d %H:%M:%S'))
             parent = str(details.parent_pid) if details.parent_pid is not None else '不可用'
@@ -204,10 +241,12 @@ class ProcessPanel(QWidget):
         self.update_stop_buttons()
         if self.key == key:
             self.operation.setText(f'正在请求{mode} PID {key[0]}…')
+            self.operation.show()
 
         def show(message):
             if not self.closed and self.key == key:
                 self.operation.setText(f'PID {key[0]}：{message}')
+                self.operation.show()
 
         def finished():
             self.stopping = False
@@ -222,6 +261,7 @@ class ProcessPanel(QWidget):
 
     def shutdown(self):
         self.closed = True
+        self.details_dialog.close()
         self.analysis.shutdown()
 
 

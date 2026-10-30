@@ -3,8 +3,8 @@ from datetime import datetime
 import time
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import (QComboBox, QGridLayout, QHBoxLayout, QHeaderView,
-    QStackedWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QComboBox, QDialog, QGridLayout, QHBoxLayout, QHeaderView,
+    QSizePolicy, QStackedWidget, QTabWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
 
 from ..core.process_analysis import AnalysisHistory, sample_analysis
 from ..platforms import system
@@ -47,22 +47,38 @@ class AnalysisPane(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 8, 0, 0)
         layout.setSpacing(10)
-        self.status = label('选择进程并打开分析页开始观察', 'muted')
+        self.status = label('选择进程后自动采样', 'muted')
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         self.findings = QTextEdit()
         self.findings.setReadOnly(True)
         self.findings.setMinimumHeight(85)
-        self.findings.setMaximumHeight(135)
         self.findings.setPlaceholderText('积累有效样本后，显示趋势和可核对的观察证据。')
-        layout.addWidget(self.findings)
+        self.ai = ProcessAiWidget(lambda: (self.report, self.process_name, self.report_at), self)
+        layout.addWidget(self.ai, 1)
+        self.details_dialog = QDialog(self)
+        self.details_dialog.setWindowTitle('资源明细 / 趋势 / 依据')
+        self.details_dialog.resize(800, 620)
+        self.details_dialog.setSizeGripEnabled(True)
+        dialog_layout = QVBoxLayout(self.details_dialog)
+        self.detail_status = label('', 'muted')
+        self.detail_status.setWordWrap(True)
+        dialog_layout.addWidget(self.detail_status)
+        detail_tabs = QTabWidget()
+        dialog_layout.addWidget(detail_tabs)
+        detail_page, details_layout = self.page()
+        detail_tabs.addTab(detail_page, '资源明细')
+        trend_page, trend_layout = self.page()
+        detail_tabs.addTab(trend_page, '变化趋势')
+        detail_tabs.addTab(self.findings, '观察依据')
         line = QHBoxLayout()
         self.section = QComboBox()
-        for caption in ('内存构成', 'CPU / 线程', 'I/O / 资源', '文件关联', 'AI 分析与预测'):
+        for caption in ('内存构成', 'CPU / 线程', 'I/O / 资源', '文件关联'):
             self.section.addItem(caption)
         line.addWidget(self.section, 1)
-        layout.addLayout(line)
+        details_layout.addLayout(line)
         self.stack = QStackedWidget()
+        self.stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         self.values = {}
         memory, memory_layout = self.page()
         self.add_values(memory_layout, (
@@ -116,9 +132,7 @@ class AnalysisPane(QWidget):
         self.events.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.events.setColumnWidth(0, 125)
         self.stack.addWidget(files)
-        self.ai = ProcessAiWidget(lambda: (self.report, self.process_name, self.report_at), self)
-        self.stack.addWidget(self.ai)
-        layout.addWidget(self.stack)
+        details_layout.addWidget(self.stack, 1)
         self.section.currentIndexChanged.connect(self.stack.setCurrentIndex)
         line = QHBoxLayout()
         line.addWidget(label('趋势指标', 'muted'))
@@ -132,14 +146,15 @@ class AnalysisPane(QWidget):
             self.metric_combo.addItem(caption, name)
             self.formats[name] = formatter
         line.addWidget(self.metric_combo, 1)
-        layout.addLayout(line)
+        trend_layout.addLayout(line)
         self.chart = TrendChart()
         self.chart.empty_text = '当前指标暂无有效数据'
-        layout.addWidget(self.chart)
+        trend_layout.addWidget(self.chart, 1)
         self.metric_combo.currentIndexChanged.connect(self.render_chart)
         self.errors = label('', 'muted')
         self.errors.setWordWrap(True)
-        layout.addWidget(self.errors)
+        self.errors.setMaximumHeight(80)
+        details_layout.addWidget(self.errors)
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
         self.timer.timeout.connect(self.request_sample)
@@ -148,6 +163,11 @@ class AnalysisPane(QWidget):
         self.trace_timer.setInterval(500)
         self.trace_timer.timeout.connect(self.poll_trace)
         self.trace_timer.start()
+
+    def show_details(self):
+        self.details_dialog.show()
+        self.details_dialog.raise_()
+        self.request_sample()
 
     def page(self):
         widget = QWidget()
@@ -169,8 +189,8 @@ class AnalysisPane(QWidget):
 
     def make_table(self, headers, layout):
         view = table(headers)
-        view.setMinimumHeight(155)
-        view.setMaximumHeight(210)
+        view.setMinimumHeight(90)
+        view.setMaximumHeight(170)
         for column in range(len(headers)):
             view.setColumnWidth(column, 90 if column else 165)
         view.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -181,9 +201,14 @@ class AnalysisPane(QWidget):
         super().showEvent(event)
         QTimer.singleShot(0, self.request_sample)
 
+    def hideEvent(self, event):
+        self.details_dialog.hide()
+        super().hideEvent(event)
+
     def set_key(self, key, name=None):
         if name is not None:
             self.process_name = name
+        self.details_dialog.setWindowTitle(f'资源明细 · {self.process_name} · PID {key[0]}' if key else '资源明细 / 趋势 / 依据')
         if self.closed or key == self.key:
             return
         self.stop_trace()
@@ -195,7 +220,8 @@ class AnalysisPane(QWidget):
         self.deep_tables = None
         self.findings.clear()
         self.errors.clear()
-        self.status.setText('等待采样 · 仅在分析页可见时观察' if key else '选择进程开始分析')
+        self.status.setText('等待进程采样…' if key else '选择进程开始分析')
+        self.detail_status.clear()
         for value, _ in self.values.values():
             value.setText('不可用')
         for view in (self.mappings, self.threads, self.files, self.events):
@@ -293,7 +319,8 @@ class AnalysisPane(QWidget):
         self.ai.refresh()
         age = f'{report.deep_age:.0f}秒前' if report.deep_age is not None else '暂无'
         suffix = ' · 详细指标采集中' if self.deep_busy else ''
-        self.status.setText(f'观察 {report.seconds:.0f}秒 · {report.samples}次采样 · 详细快照 {age}{suffix}')
+        self.status.setText(f'观察 {report.seconds:.0f}秒 · {report.samples}次采样')
+        self.detail_status.setText(f'详细快照 {age}{suffix}')
         for name, (value, formatter) in self.values.items():
             value.setText(formatter(report.metrics.get(name)))
         self.findings.setPlainText('\n\n'.join(f'{item.title}\n{item.evidence}' for item in report.findings)
@@ -380,6 +407,7 @@ class AnalysisPane(QWidget):
 
     def shutdown(self):
         self.closed = True
+        self.details_dialog.close()
         self.ai.shutdown()
         self.timer.stop()
         self.trace_timer.stop()

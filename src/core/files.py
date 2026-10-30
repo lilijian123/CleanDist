@@ -89,6 +89,7 @@ class FileChange:
 class CleanupPlan:
     root: Path
     records: tuple
+    risk_notes: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -253,14 +254,14 @@ def validate_record(root, record, *, bind=False):
     return live
 
 
-def prepare_cleanup(root, records):
+def prepare_cleanup(root, records, *, risk_notes=()):
     root = validate_plain_path(root)
     records = tuple(records)
     if not records:
         raise ValueError('请先勾选需要处理的文件')
     if len({os.path.normcase(str(record.path)) for record in records}) != len(records):
         raise ValueError('清理清单包含重复文件')
-    return CleanupPlan(root, tuple(validate_record(root, record, bind=True) for record in records))
+    return CleanupPlan(root, tuple(validate_record(root, record, bind=True) for record in records), tuple(risk_notes))
 
 
 def execute_cleanup(plan, recycler=None):

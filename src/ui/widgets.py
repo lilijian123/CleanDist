@@ -3,11 +3,11 @@ from collections import OrderedDict
 from functools import lru_cache
 from math import ceil, cos, isfinite, pi, sin
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPointF, QPropertyAnimation, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QFrame, QLabel, QLineEdit, QPushButton, QTableWidget,
-    QStyledItemDelegate, QStyleOptionViewItem, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QTableWidget,
+    QStyledItemDelegate, QStyleOptionViewItem, QTabBar, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 from .theme import color
 
@@ -28,6 +28,22 @@ def label(text='', name=None):
     if name:
         item.setObjectName(name)
     return item
+
+
+class ClickSelectionFilter(QObject):
+    """滚轮不能改变页签或下拉选项；列表视口仍使用原生滚动。"""
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Wheel and isinstance(watched, (QComboBox, QTabBar)):
+            event.ignore()
+            return True
+        return False
+
+
+def enable_click_selection():
+    app = QApplication.instance()
+    if not hasattr(app, '_click_selection_filter'):
+        app._click_selection_filter = ClickSelectionFilter(app)
+        app.installEventFilter(app._click_selection_filter)
 
 
 class BrandMark(QWidget):
@@ -149,6 +165,47 @@ def enable_pixel_scroll(view):
     view.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
     view.verticalScrollBar().setSingleStep(20)
     view.horizontalScrollBar().setSingleStep(20)
+    if not hasattr(view, '_smooth_scroll'):
+        view._smooth_scroll = SmoothScroll(view)
+
+
+class SmoothScroll(QObject):
+    """离散滚轮短时缓动；触控板像素滚动、拖拽和键盘仍即时响应。"""
+    def __init__(self, view):
+        super().__init__(view)
+        self.view = view
+        self.animation = QPropertyAnimation(view.verticalScrollBar(), b'value', self)
+        self.animation.setDuration(120)
+        self.animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        for widget in (view, view.viewport(), view.verticalScrollBar(), view.horizontalScrollBar()):
+            widget.installEventFilter(self)
+        view.verticalScrollBar().sliderPressed.connect(self.animation.stop)
+        view.verticalScrollBar().rangeChanged.connect(self.animation.stop)
+        if view.model() is not None:
+            view.model().modelReset.connect(self.animation.stop)
+
+    def eventFilter(self, watched, event):
+        if event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.KeyPress):
+            self.animation.stop()
+        if event.type() != QEvent.Type.Wheel or watched is not self.view.viewport():
+            return False
+        bar = self.view.verticalScrollBar()
+        if not event.pixelDelta().isNull() or event.modifiers() != Qt.KeyboardModifier.NoModifier or not event.angleDelta().y():
+            self.animation.stop()
+            return False
+        if bar.isSliderDown():
+            return False
+        target = self.animation.endValue() if self.animation.state() == QPropertyAnimation.State.Running else bar.value()
+        target = round(target - event.angleDelta().y() / 120 * bar.singleStep() * QApplication.wheelScrollLines())
+        target = max(bar.minimum(), min(bar.maximum(), target))
+        self.animation.stop()
+        if target == bar.value():
+            return False
+        self.animation.setStartValue(bar.value())
+        self.animation.setEndValue(target)
+        self.animation.start()
+        event.accept()
+        return True
 
 
 @lru_cache(maxsize=2)
@@ -252,6 +309,37 @@ class Metric(QFrame):
         self.value = label('—', 'metric')
         self.value.setFont(number_font())
         layout.addWidget(self.value)
+
+
+class ScanMetric(QFrame):
+    def __init__(self, title):
+        super().__init__()
+        self.setObjectName('scanCard')
+        self.setMinimumHeight(94)
+        self.setMinimumWidth(0)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(8)
+        layout.addWidget(label(title, 'scanTitle'))
+        row = QHBoxLayout()
+        row.setSpacing(7)
+        self.value = label('—', 'scanValue')
+        self.value.setFont(number_font())
+        self.value.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.unit = label('', 'scanUnit')
+        row.addWidget(self.value, 0, Qt.AlignmentFlag.AlignBaseline)
+        row.addWidget(self.unit, 0, Qt.AlignmentFlag.AlignBaseline)
+        row.addStretch()
+        layout.addLayout(row)
+
+    def set_value(self, value, unit=None):
+        text = str(value)
+        if unit is None:
+            amount, _, suffix = text.rpartition(' ')
+            text, unit = (amount, suffix) if suffix in ('B', 'KB', 'MB', 'GB', 'TB') else (text, '')
+        self.value.setText('—' if text == '不可用' else text)
+        self.unit.setText(unit)
+        self.setToolTip(f'{text} {unit}'.strip())
 
 
 class TrendChart(QWidget):

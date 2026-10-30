@@ -58,7 +58,7 @@ class OtherEntry:
 
 class Treemap(QWidget):
     directory_clicked = Signal(str)
-    file_clicked = Signal(str)
+    file_clicked = Signal(object)
     LIMIT = 180
 
     def __init__(self, parent=None):
@@ -165,7 +165,7 @@ class Treemap(QWidget):
                 if isinstance(entry, DirectoryEntry):
                     self.directory_clicked.emit(entry.relative)
                 elif not isinstance(entry, OtherEntry):
-                    self.file_clicked.emit(entry.relative)
+                    self.file_clicked.emit(entry.record)
         super().mousePressEvent(event)
 
 
@@ -182,9 +182,6 @@ class MapPage(QWidget):
         controls.addWidget(self.back_button)
         self.path_label = label('', 'muted')
         controls.addWidget(self.path_label, 1)
-        note = label('按文件逻辑大小 · 点击目录下钻', 'muted')
-        note.setToolTip('面积表示本次扫描文件的逻辑大小，不等于分区实际占用；零字节文件不绘制，极小项合并。')
-        controls.addWidget(note)
         layout.addLayout(controls)
         self.map = Treemap()
         self.map.directory_clicked.connect(self.open_directory)
@@ -200,8 +197,24 @@ class MapPage(QWidget):
 
     def show_directory(self, relative):
         self.map.set_directory(self.analysis, relative)
-        self.path_label.setText(relative.replace('\0small/', '') or '扫描根目录')
-        self.path_label.setToolTip(relative.replace('\0small/', ''))
+        text = '扫描根目录'
+        if self.analysis is not None:
+            snapshot = self.analysis.snapshot
+            root = snapshot.root
+            if hasattr(snapshot, 'snapshots'):
+                if relative:
+                    index, _, relative = relative.removeprefix('\0root/').partition('/')
+                    root = snapshot.snapshots[int(index)].root
+                else:
+                    root = None
+                    text = '所有位置'
+            if root is not None:
+                small = relative.startswith('\0small/')
+                text = str(root / relative.removeprefix('\0small/'))
+                if small:
+                    text += ' · 小文件（小于1 MB）'
+        self.path_label.setText(text)
+        self.path_label.setToolTip(text)
         self.back_button.setEnabled(bool(self.history))
 
     def open_directory(self, relative):

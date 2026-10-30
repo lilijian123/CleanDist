@@ -1,12 +1,13 @@
 """DeepSeek 设置、可取消的网络请求和进程分析回答。"""
 import json
+import re
 import time
 
-from PySide6.QtCore import QByteArray, QObject, QTimer, QUrl
+from PySide6.QtCore import QByteArray, QObject, QTimer, QUrl, Qt
 from PySide6.QtGui import QKeySequence, QTextDocument
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (QComboBox, QDialog, QHBoxLayout,
-    QLineEdit, QMenu, QTextEdit, QVBoxLayout, QWidget)
+    QLineEdit, QMenu, QSizePolicy, QTextEdit, QToolButton, QVBoxLayout, QWidget)
 
 from ..core.ai import (API_URL, MODELS, build_request, parse_response,
     read_secret, store_secret, summarize_report, validate_key)
@@ -145,7 +146,7 @@ class AiSettingsPage(QWidget):
         self.status = label('未配置 API Key', 'muted')
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
-        note = label('仅连接 DeepSeek 官方接口。保存后，下次启动自动读取密钥。API Key 加密保存在项目的 .env，自动生成的主密钥另存于 .env.key；请妥善保管这两个文件。点击 AI 分析或 AI 预测后才发送资源摘要并产生 API 用量。', 'muted')
+        note = label('仅连接 DeepSeek 官方接口。保存后，下次启动自动读取密钥。API Key 加密保存在项目的 .env，自动生成的主密钥另存于 .env.key；请妥善保管这两个文件。点击 AI 分析、AI 预测或文件条目的 AI 图标后才发送相应摘要并产生 API 用量。', 'muted')
         note.setWordWrap(True)
         layout.addWidget(note)
         layout.addStretch()
@@ -209,6 +210,120 @@ class AnswerDocument(QTextDocument):
         return QByteArray()
 
 
+def show_answer(view, text):
+    # 兼容模型偶尔忽略纯文本约束的回答，不保留标题/加粗样式或加载图片。
+    if re.search(r'(?m)^\s*(?:#{1,6}\s|[-*+>]\s|\d+[.)]\s|\|)|[`*]|!?\[[^\]\n]*\]\(|(?<!\w)_[^_\n]+_(?!\w)', text):
+        document = AnswerDocument()
+        document.setMarkdown(text, QTextDocument.MarkdownFeature.MarkdownDialectGitHub |
+                             QTextDocument.MarkdownFeature.MarkdownNoHTML)
+        text = document.toPlainText()
+    view.setPlainText(text)
+
+
+class FileAiDialog(QDialog):
+    def __init__(self, settings_page, open_settings, parent=None):
+        super().__init__(parent)
+        self.settings_page, self.open_settings = settings_page, open_settings
+        self.client = DeepSeekClient(self)
+        self.summary = None
+        self.generation = 0
+        self.busy = self.closed = False
+        self.setWindowTitle('AI 清理解读')
+        self.resize(560, 340)
+        layout = QVBoxLayout(self)
+        self.target = label('', 'section')
+        self.target.setTextFormat(Qt.TextFormat.PlainText)
+        self.target.setWordWrap(True)
+        layout.addWidget(self.target)
+        note = label('仅发送路径、大小和风险依据，不读取文件内容。AI 建议不会改变本地清理规则。', 'muted')
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.status = label('', 'muted')
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self.answer = QTextEdit()
+        self.answer.setDocument(AnswerDocument(self.answer))
+        self.answer.setReadOnly(True)
+        self.answer.setPlaceholderText('用途、清理建议和影响将显示在这里。')
+        layout.addWidget(self.answer, 1)
+        row = QHBoxLayout()
+        self.retry_button = button('重新解读', self.ask)
+        self.cancel_button = button('取消请求', self.cancel)
+        row.addWidget(self.retry_button)
+        row.addWidget(self.cancel_button)
+        row.addStretch()
+        row.addWidget(button('AI 设置', self.settings))
+        row.addWidget(button('关闭', self.close))
+        layout.addLayout(row)
+        self.finished.connect(self.cancel)
+        self.refresh()
+
+    def show_summary(self, summary):
+        if self.closed:
+            return
+        self.cancel()
+        self.summary = summary
+        self.target.setText(summary['name'])
+        self.answer.clear()
+        self.show()
+        self.raise_()
+        self.ask()
+
+    def refresh(self):
+        self.retry_button.setEnabled(not self.closed and not self.busy)
+        self.cancel_button.setVisible(self.busy)
+
+    def ask(self):
+        if self.closed or self.busy or self.summary is None:
+            return
+        try:
+            key, model = self.settings_page.credentials()
+            if not key:
+                raise ValueError('请先打开 AI 设置，填写并保存 DeepSeek API Key。')
+            payload = build_request(self.summary, 'cleanup', model)
+        except ValueError as error:
+            self.status.setText(str(error))
+            return
+        self.generation += 1
+        generation = self.generation
+        self.busy = True
+        self.answer.clear()
+        self.status.setText('正在等待 DeepSeek 解读…')
+        self.refresh()
+
+        def show(text, success):
+            if self.closed or generation != self.generation:
+                return
+            self.busy = False
+            self.status.setText('已收到解读' if success else text)
+            if success:
+                show_answer(self.answer, text)
+            self.refresh()
+
+        try:
+            self.client.start(key, payload, lambda text: show(text, True), lambda text: show(text, False))
+        except (ValueError, RuntimeError):
+            show('请求未能发出，请检查 API Key 或重新尝试。', False)
+
+    def cancel(self):
+        self.generation += 1
+        self.client.cancel()
+        if self.busy:
+            self.status.setText('已取消请求。已发出的请求可能仍产生 API 用量。')
+        self.busy = False
+        self.refresh()
+
+    def settings(self):
+        self.close()
+        self.open_settings()
+
+    def shutdown(self):
+        self.closed = True
+        self.cancel()
+        self.close()
+
+
 class ProcessAiWidget(QWidget):
     def __init__(self, context, parent=None):
         super().__init__(parent)
@@ -226,25 +341,43 @@ class ProcessAiWidget(QWidget):
         for widget in (self.analyze_button, self.predict_button, self.cancel_button):
             row.addWidget(widget)
         layout.addLayout(row)
+        self.more_toggle = QToolButton()
+        self.more_toggle.setText('发送内容与设置')
+        self.more_toggle.setCheckable(True)
+        self.more_toggle.setAutoRaise(True)
+        self.more_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.more_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        layout.addWidget(self.more_toggle, 0, Qt.AlignmentFlag.AlignLeft)
+        self.options = QWidget()
+        options_layout = QVBoxLayout(self.options)
+        options_layout.setContentsMargins(0, 0, 0, 0)
         row = QHBoxLayout()
         self.preview_button = button('查看发送摘要', self.preview)
         row.addWidget(self.preview_button)
         row.addWidget(button('AI 设置', lambda: self.open_settings() if self.open_settings else None))
         row.addStretch()
-        layout.addLayout(row)
+        options_layout.addLayout(row)
         self.status = label('等待有效采样；先在 AI 设置中保存 API Key。', 'muted')
         self.status.setWordWrap(True)
-        layout.addWidget(self.status)
         note = label('发送所选进程的数值指标与有限趋势，不发送完整路径、文件内容或命令行。预测仅基于观察窗口，供排查参考。', 'muted')
         note.setWordWrap(True)
-        layout.addWidget(note)
+        options_layout.addWidget(note)
+        self.options.hide()
+        layout.addWidget(self.options)
+        layout.addWidget(self.status)
+        self.more_toggle.toggled.connect(self.toggle_options)
         self.answer = QTextEdit()
         self.answer.setDocument(AnswerDocument(self.answer))
         self.answer.setReadOnly(True)
-        self.answer.setMinimumHeight(280)
+        self.answer.setMinimumHeight(80)
+        self.answer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.answer.setPlaceholderText('DeepSeek 的回答将显示在这里，可选择并复制。')
-        layout.addWidget(self.answer)
+        layout.addWidget(self.answer, 1)
         self.refresh()
+
+    def toggle_options(self, expanded):
+        self.options.setVisible(expanded)
+        self.more_toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
 
     def refresh(self):
         report, _, captured = self.context()
@@ -253,6 +386,7 @@ class ProcessAiWidget(QWidget):
         self.predict_button.setEnabled(ready and not self.busy)
         self.preview_button.setEnabled(ready)
         self.cancel_button.setEnabled(self.busy)
+        self.cancel_button.setVisible(self.busy)
         if ready and not self.busy and self.status.text().startswith('等待有效采样'):
             self.status.setText('基础指标已就绪，可进行 AI 分析或 AI 预测；详细指标将陆续补充。')
 
@@ -290,8 +424,7 @@ class ProcessAiWidget(QWidget):
             self.busy = False
             self.status.setText(heading + ('\n已收到回答' if success else '\n' + text))
             if success:
-                self.answer.document().setMarkdown(text, QTextDocument.MarkdownFeature.MarkdownDialectGitHub |
-                                                    QTextDocument.MarkdownFeature.MarkdownNoHTML)
+                show_answer(self.answer, text)
             self.refresh()
         try:
             self.client.start(key, payload, lambda text: show(text, True), lambda text: show(text, False))
