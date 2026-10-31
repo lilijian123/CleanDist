@@ -147,6 +147,7 @@ def analyze_usage(snapshot, cancel=None, progress=None):
 
 
 SAMPLE_BYTES = 16 * 1024
+HEADER_BYTES = 4 * 1024
 SMALL_FULL_BYTES = 64 * 1024
 
 
@@ -155,7 +156,9 @@ def file_digest(record, cancel, sample, seen=None):
     with checked_file(record, cancel) as (stream, live):
         if seen is not None and (live.device, live.inode) in seen:
             return None, live
-        if sample and live.size > SMALL_FULL_BYTES:
+        if sample == 'head' and live.size > SMALL_FULL_BYTES:
+            digest.update(stream.read(HEADER_BYTES))
+        elif sample and live.size > SMALL_FULL_BYTES:
             tail = live.size - SAMPLE_BYTES
             for offset in (0, tail // 2, tail):
                 if cancel.is_set():
@@ -186,6 +189,7 @@ def find_duplicates(snapshot, cancel=None, progress=None, *, minimum_bytes=1):
         if record.size >= minimum_bytes:
             sizes[record.size].append(record)
     candidates = [record for group in sizes.values() if len(group) > 1 for record in group]
+    headers = defaultdict(list)
     samples = defaultdict(list)
     hashes = defaultdict(list)
     seen = set()
@@ -193,7 +197,7 @@ def find_duplicates(snapshot, cancel=None, progress=None, *, minimum_bytes=1):
         if cancel.is_set():
             break
         try:
-            digest, live = file_digest(record, cancel, True, seen)
+            digest, live = file_digest(record, cancel, 'head', seen)
             identity = live.device, live.inode
             if digest is None:
                 result.hardlinks += 1
@@ -203,14 +207,26 @@ def find_duplicates(snapshot, cancel=None, progress=None, *, minimum_bytes=1):
             if live.size <= SMALL_FULL_BYTES:
                 hashes[(live.size, digest)].append(live)
             else:
-                samples[(live.size, digest)].append(live)
+                headers[(live.size, digest)].append(live)
             result.checked += 1
         except Cancelled:
             break
         except (OSError, ValueError) as error:
             note_error(result, record, error)
         if progress and index % 16 == 0:
-            progress('筛选内容指纹', index + 1, len(candidates))
+            progress('快速比对文件头', index + 1, len(candidates))
+    middle = [record for group in headers.values() if len(group)>1 for record in group]
+    for index, record in enumerate(middle):
+        if cancel.is_set(): break
+        try:
+            digest, live = file_digest(record, cancel, True)
+            samples[(live.size, digest)].append(live)
+        except Cancelled:
+            break
+        except (OSError, ValueError) as error:
+            note_error(result, record, error)
+        if progress and index % 16 == 0:
+            progress('筛选内容指纹', index + 1, len(middle))
     full = [record for group in samples.values() if len(group) > 1 for record in group]
     for index, record in enumerate(full):
         if cancel.is_set():

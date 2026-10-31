@@ -128,6 +128,7 @@ class DuplicatePage(QWidget):
         for title, size in (('500 KB 以上', 500*1024), ('1 MB 以上', 1024**2), ('50 MB 以上', 50*1024**2), ('200 MB 以上', 200*1024**2)):
             self.minimum.addItem(title, size)
         self.minimum.setToolTip('先按大小过滤，再读取内容比对；1 KB = 1024 B，1 MB = 1024 KB。')
+        self.minimum.setCurrentIndex(1)
         actions.addWidget(self.minimum)
         self.start_button = button('开始内容比对', self.startRequested.emit)
         self.stop_button = button('停止比对', self.stopRequested.emit)

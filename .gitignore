@@ -1,5 +1,9 @@
 .venv/
 .venv-linux/
+frontend/node_modules/
+frontend/dist/
+/.desktop-settings.json
+/.desktop-settings.*.tmp
 /.env
 /.env.key
 /.env.*.tmp

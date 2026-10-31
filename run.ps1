@@ -8,9 +8,9 @@ if (-not (Test-Path -LiteralPath $projectPython)) {
     & $systemPython.Source -m venv .venv
     if ($LASTEXITCODE -ne 0) { throw 'Could not create the virtual environment.' }
 }
-& $projectPython -c "import importlib.util,sys; sys.exit(0 if all(importlib.util.find_spec(m) is not None for m in ('psutil','PySide6','send2trash','cryptography')) else 1)"
+& $projectPython -c "import importlib.util,sys; sys.exit(0 if all(importlib.util.find_spec(m) is not None for m in ('psutil','PySide6','send2trash','cryptography','webview')) else 1)"
 if ($LASTEXITCODE -ne 0) {
-    & $projectPython -m pip install --only-binary=:all: -r requirements.txt
+    & $projectPython -m pip install --prefer-binary -r requirements.txt
     if ($LASTEXITCODE -ne 0) { throw 'Could not install dependencies. Check network access.' }
 }
 $appArguments = @('-X', 'utf8', (Join-Path $PSScriptRoot 'main.py'))

@@ -10,5 +10,5 @@ if [[ ! -x .venv-linux/bin/python ]] || ! .venv-linux/bin/python -m pip --versio
     fi
 fi
 # Reconcile pins as well as missing imports, including existing 6.12 environments.
-.venv-linux/bin/python -m pip install --quiet --disable-pip-version-check --only-binary=:all: -r requirements.txt
+.venv-linux/bin/python -m pip install --quiet --disable-pip-version-check --prefer-binary -r requirements.txt
 exec .venv-linux/bin/python -X utf8 main.py "$@"

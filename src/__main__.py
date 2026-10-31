@@ -1,4 +1,4 @@
-"""命令行入口，仅在启动桌面界面时加载 Qt。"""
+"""命令行入口，默认启动Vue桌面。"""
 import argparse
 import sys
 
@@ -7,9 +7,14 @@ from . import APP_NAME
 
 
 def main():
-    parser = argparse.ArgumentParser(description=f'{APP_NAME} {system.NAME}桌面原型')
+    parser = argparse.ArgumentParser(description=f'{APP_NAME} {system.NAME}桌面应用')
     parser.add_argument('--demo', action='store_true', help='启动自建临时数据的演示')
+    parser.add_argument('--legacy', action='store_true', help='启动旧版Qt界面进行兼容性对照')
     args = parser.parse_args()
+
+    if not args.legacy:
+        from .desktop.app import main as desktop_main
+        return desktop_main(demo=args.demo)
 
     from PySide6.QtCore import QTimer
     from PySide6.QtGui import QFont
