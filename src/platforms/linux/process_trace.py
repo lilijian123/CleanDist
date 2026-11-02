@@ -21,11 +21,12 @@ from ...core.processes import matching_process
 from ...core.process_trace import TraceEvent, TraceState
 
 
-_OPERATIONS = 'read,write,pread64,pwrite64,readv,writev,preadv,pwritev,preadv2,pwritev2'
-_COVERAGE = '仅读写系统调用返回字节；不覆盖 mmap 修改、缓存落盘或开始前的行为；耗时含等待/调度，不等于设备硬件延迟；受 ptrace 权限限制'
+_OPERATIONS = 'read,write,pread64,pwrite64,readv,writev,preadv,pwritev,preadv2,pwritev2,unlink,unlinkat'
+_COVERAGE = '读写系统调用返回字节及 unlink/unlinkat 成败；删除字节未知且已删除文件不能事后回收；不覆盖 mmap 修改、缓存落盘或开始前的行为；耗时含等待/调度，不等于设备硬件延迟；受 ptrace 权限限制'
 _MAX_LINE = 16384
 _HEADER = re.compile(r'^(?:(?:\[pid\s+(\d+)\]|(\d+))\s+)?(\d+\.\d+)\s+(.*)$')
 _CALL = re.compile(r'^(' + _OPERATIONS.replace(',', '|') + r')\(\d+<([^>]+)>,')
+_UNLINK = re.compile(r'^(unlink|unlinkat)\((?:(?:AT_FDCWD|\d+)(?:<([^>]+)>)?,\s*)?"((?:[^"\\]|\\.)*)"')
 _RESUMED = re.compile(r'^<\.\.\. (\w+) resumed>')
 _RESULT = re.compile(r'\)\s+=\s+(-?\d+)(?:\s+[A-Z][A-Z0-9_]*(?:\s+\([^\r\n]*\))?)?(?:\s+<(\d+\.\d+)>)?\s*$')
 _ESCAPE = re.compile(r'\\(?:[\\\"\'abfnrtv]|[0-7]{1,3}|x[0-9a-fA-F]{2})')
@@ -79,15 +80,21 @@ class _TraceParser:
                 return None
             operation, path = saved
         else:
-            call = _CALL.match(body)
+            deletion = _UNLINK.match(body)
+            call = deletion or _CALL.match(body)
             if not call:
                 # Known non-path descriptors (sockets/pipes/anon_inode) are not files.
                 if re.match(r'^(?:' + _OPERATIONS.replace(',', '|') + r')\(\d+<(?:pipe:|socket:|TCP|UDP|UNIX|anon_inode:)', body):
                     return None
                 self.unparsed += 1
                 return None
-            operation, path = call.groups()
-            if not path.startswith('/'):
+            if deletion:
+                operation, directory, path = deletion.groups()
+                if directory and not path.startswith('/'):
+                    path = directory.rstrip('/') + '/' + path
+            else:
+                operation, path = call.groups()
+            if not deletion and not path.startswith('/'):
                 return None
             # Decode only strace's documented C/octal escapes; unfamiliar forms are unknown.
             if '\\' in _ESCAPE.sub('', path):
@@ -106,10 +113,14 @@ class _TraceParser:
             self.unparsed += 1
             return None
         count = int(result[1])
+        if operation in ('unlink', 'unlinkat'):
+            return TraceEvent(timestamp, tid, operation, path, None,
+                              float(result[2]) if result[2] is not None else None,
+                              count, count == 0)
         if count <= 0:
             return None
         return TraceEvent(timestamp, tid, operation, path, count,
-                          float(result[2]) if result[2] is not None else None)
+                          float(result[2]) if result[2] is not None else None, count, True)
 
 
 class FileTrace:

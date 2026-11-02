@@ -3,6 +3,7 @@ import ctypes
 from ctypes import wintypes
 import msvcrt
 import os
+from pathlib import Path
 
 
 class StandardInfo(ctypes.Structure):
@@ -56,3 +57,34 @@ def allocated_bytes(stream):
     if not _query(handle, 8 if compressed else 1, ctypes.byref(info), ctypes.sizeof(info)):
         raise ctypes.WinError(ctypes.get_last_error())
     return max(0, info.allocated)
+
+
+def duplicate_workers(root):
+    """只在固定卷明确报告无寻道开销时并行；机械盘/远程/未知卷保持顺序读取。"""
+    drive_type = _kernel.GetDriveTypeW
+    drive_type.argtypes, drive_type.restype = [wintypes.LPCWSTR], wintypes.UINT
+    volume_path = _kernel.GetVolumePathNameW
+    volume_path.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    volume_path.restype = wintypes.BOOL
+    mount = ctypes.create_unicode_buffer(32768)
+    anchor = Path(root).anchor
+    if (not anchor or drive_type(anchor) != 3
+            or not volume_path(str(root), mount, len(mount))
+            or os.path.normcase(mount.value) != os.path.normcase(anchor)):
+        return 1
+    handle = _open('\\\\.\\' + Path(root).drive, 0, 7, None, 3, 0, None)
+    if handle == wintypes.HANDLE(-1).value:
+        return 1
+    control = _kernel.DeviceIoControl
+    control.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                        ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    control.restype = wintypes.BOOL
+    query = (wintypes.DWORD * 3)(7, 0, 0)  # StorageDeviceSeekPenaltyProperty
+    descriptor, returned = ctypes.create_string_buffer(12), wintypes.DWORD()
+    try:
+        if control(handle, 0x2D1400, query, ctypes.sizeof(query), descriptor,
+                   len(descriptor), ctypes.byref(returned), None) and returned.value >= 9:
+            return 1 if descriptor.raw[8] else 4
+        return 1
+    finally:
+        _close(handle)

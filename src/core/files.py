@@ -135,7 +135,7 @@ class ScanProgress:
     backend: str
 
 
-def scan_directory(root, cancel=None, limit=None, progress=None, *, backend='auto'):
+def scan_directory(root, cancel=None, limit=None, progress=None, *, backend='auto', minimum_bytes=0):
     root = validate_plain_path(root)
     if not root.is_dir():
         raise ValueError('请选择一个可访问的目录')
@@ -143,7 +143,7 @@ def scan_directory(root, cancel=None, limit=None, progress=None, *, backend='aut
         raise ValueError('扫描数量限制必须大于0')
     cancel = cancel or threading.Event()
     if backend != 'python':
-        native_snapshot = system.scan_native(root, cancel, limit, progress)
+        native_snapshot = system.scan_native(root, cancel, limit, progress, minimum_bytes=minimum_bytes)
         if native_snapshot is not None:
             return native_snapshot
     start = time.monotonic()
@@ -173,6 +173,8 @@ def scan_directory(root, cancel=None, limit=None, progress=None, *, backend='aut
                         elif stat.S_ISDIR(info.st_mode):
                             stack.append(Path(entry.path))
                         elif stat.S_ISREG(info.st_mode):
+                            if info.st_size < minimum_bytes:
+                                continue
                             if limit is not None and len(records) >= limit:
                                 truncated = True
                                 break

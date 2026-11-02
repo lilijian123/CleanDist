@@ -38,7 +38,7 @@ def get_scan_helper():
     return executable
 
 
-def scan_native(root, cancel, limit, progress, *, apps_only=False):
+def scan_native(root, cancel, limit, progress, *, apps_only=False, minimum_bytes=0):
     from ...core.files import DirectorySnapshot, FileRecord, ScanProgress, free_disk_bytes
     start = time.monotonic()
     files, directories, errors = {}, [], []
@@ -55,6 +55,8 @@ def scan_native(root, cancel, limit, progress, *, apps_only=False):
     arguments = [str(executable), str(root)]
     if apps_only:
         arguments.append('--apps')
+    elif minimum_bytes:
+        arguments.extend(('--minimum', str(minimum_bytes)))
     process = subprocess.Popen(arguments, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW,
                                bufsize=1024 * 1024)

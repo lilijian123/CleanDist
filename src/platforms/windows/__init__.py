@@ -4,7 +4,8 @@ import sys
 from types import SimpleNamespace
 
 from .. import common
-from ..common import recycle, FileTrace, process_created
+from ..common import recycle, process_created
+from .process_trace import FileTrace
 from ..common import (APP_SOURCES, APP_PUBLISHER_LABEL, PROCESS_COUNTER_LABEL, PRIVATE_MEMORY_LABEL,
                       PRIVATE_MEMORY_NOTE, PROTECTED_PIDS, STOP_EXPLANATION,
                       process_counter, private_memory)
@@ -12,7 +13,7 @@ from .apps import scan_apps
 from .icons import load_app_icons, load_process_icons
 from .disks import list_disks
 from .scan import scan_native
-from .storage import allocated_bytes, open_metadata
+from .storage import allocated_bytes, open_metadata, duplicate_workers
 from .watch import DirectoryWatch
 from .processes import stop_process
 from .analysis import sample_memory_breakdown, thread_identity

@@ -90,7 +90,7 @@ class BatchAnalysis:
         return self.snapshot.files.values()
 
 
-def scan_batch(roots, cancel=None, progress=None):
+def scan_batch(roots, cancel=None, progress=None, *, minimum_bytes=0):
     start = time.monotonic()
     cancel = cancel if cancel is not None else threading.Event()
     normalized = {}
@@ -109,7 +109,7 @@ def scan_batch(roots, cancel=None, progress=None):
     def scan(root, callback):
         if cancel.is_set():
             return None
-        return scan_directory(root, cancel=cancel, progress=callback)
+        return scan_directory(root, cancel=cancel, progress=callback, minimum_bytes=minimum_bytes)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         jobs = {}
@@ -136,13 +136,14 @@ def scan_batch(roots, cancel=None, progress=None):
                      time.monotonic() - start, _cancelled=cancel.is_set())
 
 
-def analyze_batch(batch, cancel=None):
+def analyze_batch(batch, cancel=None, *, purpose=None):
     if cancel is not None and cancel.is_set():
         return None
-    running = running_applications()
+    running = running_applications() if purpose in (None, 'cleanup') else None
     items, by_file = {}, {}
-    for snapshot in batch.snapshots:
-        cleanup = classify_cleanup(snapshot, running=running, cancel=cancel)
+    for snapshot in (() if purpose == 'matrix' else batch.snapshots):
+        cleanup = classify_cleanup(snapshot, running=running, cancel=cancel,
+                                   protected_only=purpose in ('large', 'duplicates'))
         if cleanup is None:
             return None
         for item in cleanup.items:
@@ -162,7 +163,7 @@ def analyze_batch(batch, cancel=None):
     ordered = tuple(sorted((item for item in items.values() if item.records),
                            key=lambda item: (order[item.category], ('low', 'medium', 'high').index(item.risk), -item.size)))
     large_records = []
-    for index, record in enumerate(batch.files.values()):
+    for index, record in enumerate(batch.files.values() if purpose in (None, 'large') else ()):
         if index % 4096 == 0 and cancel is not None and cancel.is_set():
             return None
         if record.size >= 1024 * 1024:

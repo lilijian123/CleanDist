@@ -21,6 +21,15 @@ def ensure_frontend():
     npm = shutil.which('npm.cmd' if sys.platform == 'win32' else 'npm')
     if not npm:
         raise RuntimeError('网页界面尚未构建。请安装Node.js 22.12以上，在frontend目录运行 npm ci 和 npm run build。')
+    if sys.platform.startswith('linux'):
+        node = shutil.which('node')
+        message = ('请在 Ubuntu / Linux 内安装 Linux 版 Node.js 22.12 以上（含 npm），不能使用 Windows 的 npm。'
+                   '执行 node -p process.platform 应显示 linux，然后重新运行 bash run.sh。')
+        if not node or Path(npm).resolve().with_name('node.exe').is_file():
+            raise RuntimeError(message)
+        runtime = subprocess.run([node, '-p', 'process.platform'], capture_output=True, text=True)
+        if runtime.returncode or runtime.stdout.strip() != 'linux':
+            raise RuntimeError(message)
     options = {'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
     installed = frontend/'node_modules'/'.package-lock.json'
     if not installed.exists() or any(path.exists() and path.stat().st_mtime > installed.stat().st_mtime for path in manifests):

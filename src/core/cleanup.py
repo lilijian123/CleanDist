@@ -67,7 +67,8 @@ def running_applications():
 _AUTO = object()
 
 
-def classify_cleanup(snapshot, *, platform=None, environ=None, home=None, now=None, running=_AUTO, cancel=None):
+def classify_cleanup(snapshot, *, platform=None, environ=None, home=None, now=None, running=_AUTO, cancel=None,
+                     protected_only=False):
     """精确目录前缀匹配；未知文件不成为清理候选。同一文件只有一个归属。"""
     windows = (platform or system.NAME) == 'Windows'
     environ = os.environ if environ is None else environ
@@ -167,7 +168,7 @@ def classify_cleanup(snapshot, *, platform=None, environ=None, home=None, now=No
 
     manifest_dirs = {}
     marker_names = {'cargo.toml' if windows else 'Cargo.toml', 'pom.xml', 'package.json'}
-    for index, relative in enumerate(snapshot.files):
+    for index, relative in enumerate(() if protected_only else snapshot.files):
         if index % 4096 == 0 and cancel is not None and cancel.is_set():
             return None
         name = relative.rsplit('/', 1)[-1]
@@ -193,6 +194,8 @@ def classify_cleanup(snapshot, *, platform=None, environ=None, home=None, now=No
             # 保护规则优先于任何更深的缓存/临时目录，包括环境变量指定的重叠位置。
             matched = next((protected_rules[path[:length]] for length in range(len(path)-1, 0, -1)
                             if path[:length] in protected_rules), None)
+        if protected_only and not matched:
+            continue
         for length in range(len(path) - 1, 0, -1):
             if matched:
                 break

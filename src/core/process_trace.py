@@ -8,8 +8,10 @@ class TraceEvent:
     tid: int
     operation: str
     path: str
-    bytes_count: int
+    bytes_count: int | None
     duration_seconds: float | None = None
+    return_value: int | None = None
+    success: bool | None = None
 
 
 @dataclass(frozen=True)

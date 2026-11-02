@@ -67,6 +67,7 @@ class ProcessService:
         self._history = AnalysisHistory()
         self._snapshot = None
         self._rows = ()
+        self._parents = {}
         self._key = None
         self._name = ''
         self._generation = 0
@@ -74,6 +75,8 @@ class ProcessService:
         self._sample_at = None
         self._trace = None
         self._trace_requested = False
+        self._trace_listener = None
+        self._trace_seen = set()
         self._message = ''
         self._stopping = False
         # Deep reads can block on OS permissions and large mappings. They never
@@ -108,6 +111,7 @@ class ProcessService:
         with self._lock:
             if not self._closed.is_set():
                 self._snapshot, self._rows = snapshot, snapshot.processes
+                self._parents = {row.key: row.parent_key for row in snapshot.processes if row.parent_key is not None}
                 active = {row.key for row in self._rows}
                 self._icons = {key:data for key,data in self._icons.items() if key in active}
                 self._icon_queue = {key:None for key in self._icon_queue if key in active}
@@ -160,6 +164,7 @@ class ProcessService:
         key, generation = self._selection()
         if not key:
             return
+        self._notify_trace()
         try:
             sample = sample_analysis(key)
             with self._lock:
@@ -213,16 +218,19 @@ class ProcessService:
                 result['selected'] = {'key': list(self._key), 'name': self._name,
                     'details': details, 'report': _report_json(self._report) if self._report else None,
                     'summary': summary, 'trace': self._trace_state(), 'message': self._message}
+                result['selected']['report_time_offset'] = time.time() - time.monotonic()
             return _json(result)
 
-    def rows(self, offset=0, limit=100, query='', sort='rss'):
+    def rows(self, offset=0, limit=100, query='', sort='rss', tree=False):
         offset, limit = _page(offset, limit)
+        if type(tree) is not bool: raise ValueError('无效的进程树开关')
         if sort not in ('rss', 'delta', 'name', 'pid', 'seconds'):
             raise ValueError('无效的进程排序方式')
         query = str(query).strip().casefold()
         with self._lock:
             rows = [row for row in self._rows if not query or query in row.name.casefold()
                     or query in str(row.key[0])]
+            parents = dict(self._parents)
         if sort == 'name':
             rows.sort(key=lambda row: (row.name.casefold(), row.key))
         elif sort == 'pid':
@@ -230,9 +238,29 @@ class ProcessService:
         else:
             field = 'observed_seconds' if sort == 'seconds' else sort
             rows.sort(key=lambda row: (getattr(row, field) is not None, getattr(row, field) or 0), reverse=True)
+        depths = {}
+        if tree:
+            active = {row.key for row in rows}
+            children = {}
+            for row in rows:
+                parent = parents.get(row.key)
+                if parent not in active or parent == row.key or parent[1] > row.key[1]: parent = None
+                children.setdefault(parent, []).append(row)
+            ordered, visited = [], set()
+            def visit(row, depth):
+                if row.key in visited: return
+                visited.add(row.key)
+                depths[row.key] = depth
+                ordered.append(row)
+                for child in children.get(row.key, ()): visit(child, depth + 1)
+            for row in children.get(None, ()): visit(row, 0)
+            for row in rows:
+                if row.key not in visited: visit(row, 0)
+            rows = ordered
         return _json({'total': len(rows), 'rows': [{'id': f'{row.key[0]}:{row.key[1]}',
             'key': row.key, 'name': row.name, 'rss': row.rss, 'delta': row.delta,
-            'seconds': row.observed_seconds} for row in rows[offset:offset + limit]]})
+            'seconds': row.observed_seconds, 'depth': depths.get(row.key, 0),
+            'parent_key': parents.get(row.key)} for row in rows[offset:offset + limit]]})
 
     def select(self, key):
         key = _key(key)
@@ -251,6 +279,7 @@ class ProcessService:
             if key != self._key:
                 old_trace, self._trace = self._trace, None
                 self._trace_requested = False
+                self._trace_seen.clear()
                 if old_trace:
                     old_trace.close()
                 self._generation += 1
@@ -310,6 +339,25 @@ class ProcessService:
         result['events'] = _json(state.events[-200:])
         return result
 
+    def set_trace_listener(self, callback):
+        self._trace_listener = callback
+
+    def _notify_trace(self):
+        with self._lock:
+            if self._trace is None or self._trace_listener is None: return
+            events = self._trace.snapshot().events
+            current = {(event.timestamp, event.tid, event.operation, event.path) for event in events}
+            pending = [event for event in events if
+                       (event.timestamp, event.tid, event.operation, event.path) not in self._trace_seen]
+            self._trace_seen = current
+            callback = self._trace_listener
+        for event in pending:
+            if (event.path and Path(event.path).is_absolute() and
+                    (event.operation in ('write', 'pwrite64', 'writev', 'pwritev', 'pwritev2') and
+                     event.bytes_count is not None and event.bytes_count > 0 or
+                     event.operation in ('unlink', 'unlinkat') and event.success is True)):
+                callback(event.path, source='ptrace' if system.NAME == 'Linux' else 'etw')
+
     def trace(self, enabled=True):
         if type(enabled) is not bool:
             raise ValueError('无效的跟踪开关')
@@ -317,11 +365,12 @@ class ProcessService:
             if self._closed.is_set() or not self._key:
                 raise ValueError('请先选择进程')
             if enabled:
-                if self._trace is None or not self._trace_requested:
+                if self._trace is None or not self._trace_requested or self._trace.snapshot().finished:
                     matching_process(self._key)
                     if self._trace is not None:
                         self._trace.close()
                     self._trace = system.FileTrace(self._key)
+                    self._trace_seen.clear()
                     self._trace.start()
                     self._trace_requested = True
             elif self._trace is not None:

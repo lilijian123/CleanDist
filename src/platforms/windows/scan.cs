@@ -41,6 +41,7 @@ internal static class Scan {
     private static long PendingDirectories = 1, LastFlush;
     private static Exception WorkerError;
     private static bool AppsOnly;
+    private static ulong MinimumBytes;
     // 应用候选模式排除系统和依赖目录，不改变普通文件扫描的遍历范围。
     private static readonly HashSet<string> AppSkip = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
         "Windows", "$Recycle.Bin", "System Volume Information", "$Windows.~BT",
@@ -99,8 +100,10 @@ internal static class Scan {
                         Directories.Add(child);
                     } else {
                         if (AppsOnly && !data.Name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) continue;
+                        ulong size = ((ulong)data.SizeHigh << 32) | data.SizeLow;
+                        if (size < MinimumBytes) continue;
                         writer.Write((byte)'F'); WriteText(writer, child);
-                        writer.Write(((ulong)data.SizeHigh << 32) | data.SizeLow);
+                        writer.Write(size);
                         writer.Write(PackFileTime(data.Modified)); writer.Write(PackFileTime(data.Created));
                     }
                     if (buffer.Length >= 65536) FlushBuffer(buffer);
@@ -126,8 +129,9 @@ internal static class Scan {
 
     public static int Main(string[] args) {
         try {
-            if (args.Length < 1 || args.Length > 2 || (args.Length == 2 && args[1] != "--apps")) return 2;
-            AppsOnly = args.Length == 2;
+            if (args.Length == 2 && args[1] == "--apps") AppsOnly = true;
+            else if (args.Length == 3 && args[1] == "--minimum") MinimumBytes = ulong.Parse(args[2]);
+            else if (args.Length != 1) return 2;
             Root = Path.GetFullPath(args[0]).TrimEnd('\\') + "\\";
             if (!Root.StartsWith(@"\\?\")) Root = Root.StartsWith(@"\\") ? @"\\?\UNC\" + Root.Substring(2) : @"\\?\" + Root;
             Output = new BinaryWriter(new BufferedStream(Console.OpenStandardOutput(), 1048576), Encoding.UTF8);

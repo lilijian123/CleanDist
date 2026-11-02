@@ -31,7 +31,8 @@ class _Group:
 
 
 class FileService:
-    def __init__(self):
+    def __init__(self, purpose=None):
+        self._purpose = purpose
         self._lock = threading.RLock()
         self._threads = []
         self._closed = False
@@ -106,7 +107,9 @@ class FileService:
                         errors=list(self._errors), categories=[dict(id=key, name=name) for key, name in CATEGORIES.items()],
                         duplicates={**self._duplicate_state, 'job': self._duplicate_job}, operation=dict(self._operation))
 
-    def scan(self, roots, kind='folder'):
+    def scan(self, roots, kind='folder', minimum=1024**2):
+        if type(minimum) is not int or minimum < 1:
+            raise ValueError('最小文件大小必须大于0')
         if kind not in ('folder', 'disk'):
             raise ValueError('未知的扫描入口')
         if not isinstance(roots, (list, tuple)) or not roots:
@@ -165,14 +168,18 @@ class FileService:
 
             def work():
                 try:
-                    batch = scan_batch(paths, cancel=cancel, progress=progress)
-                    analysis = analyze_batch(batch, cancel=cancel)
+                    batch = scan_batch(paths, cancel=cancel, progress=progress,
+                                       minimum_bytes=minimum if self._purpose == 'duplicates' else 0)
+                    analysis = analyze_batch(batch, cancel=cancel, purpose=self._purpose)
                     with self._lock:
                         if generation != self._generation or cancel.is_set() or analysis is None:
                             return
                         self._install(batch, analysis)
                         self._status = '扫描完成' if batch.complete else '扫描完成，部分位置未确认'
                         self._progress = dict(done=len(batch.files), total=len(batch.files), stage='完成')
+                        if self._purpose == 'duplicates':
+                            self._busy = False
+                            self.duplicates(minimum=minimum)
                 except Exception as error:
                     with self._lock:
                         if generation == self._generation and not cancel.is_set():
@@ -193,7 +200,8 @@ class FileService:
         self._paths = {key: str(record.path).casefold() for key, record in self._records.items()}
         self._readonly = {record_key(record) for record in analysis.cleanup.readonly_records()}
         cleanup = {_item.key: _Group(_item.key, _item.name, tuple(_item.records), _item.risk,
-                    _item.reason, _item.category, _item.recommended) for _item in analysis.cleanup.items}
+                    _item.reason, _item.category, _item.recommended) for _item in analysis.cleanup.items
+                   if self._purpose in (None, 'cleanup')}
         large = _Group('large', '大文件', tuple(analysis.large_records), reason='大文件不一定无用；请确认用途后手动选择。')
         self._group_index = {'cleanup': cleanup, 'large': {'large': large} if large.records else {}, 'duplicates': {}}
         self._record_groups = {tool: {record_key(record): group for group in groups.values() for record in group.records}
@@ -527,7 +535,7 @@ class FileService:
             snapshots = tuple(replace(snapshot, files={key: record for key, record in snapshot.files.items()
                               if record_key(record) not in excluded}) for snapshot in batch.snapshots)
             updated = ScanBatch(snapshots, batch.errors, batch.elapsed, batch.cancelled)
-            analysis = analyze_batch(updated)
+            analysis = analyze_batch(updated, purpose=self._purpose)
             with self._lock:
                 if analysis is not None:
                     self._install(updated, analysis)

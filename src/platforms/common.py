@@ -20,6 +20,10 @@ PROTECTED_PIDS = (0, 4)
 STOP_EXPLANATION = '只发送普通结束请求，不结束子进程。'
 
 
+def duplicate_workers(root):
+    return 1
+
+
 def process_counter(process):
     return process.num_handles() if hasattr(process, 'num_handles') else None
 
@@ -81,7 +85,7 @@ def open_metadata(path):
         os.close(descriptor)
 
 
-def scan_native(root, cancel, limit, progress):
+def scan_native(root, cancel, limit, progress, *, minimum_bytes=0):
     return None
 
 

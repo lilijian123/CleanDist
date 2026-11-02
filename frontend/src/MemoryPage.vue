@@ -5,8 +5,10 @@ import VirtualList from './VirtualList.vue'
 import ClickSelect from './ClickSelect.vue'
 import TrendChart from './TrendChart.vue'
 import AiPanel from './AiPanel.vue'
-const props = defineProps({ memory: { type: Object, default: () => ({}) }, ai: Object, boot: Object })
+import ProcessGovernance from './ProcessGovernance.vue'
+const props = defineProps({ memory: { type: Object, default: () => ({}) }, ai: Object, boot: Object, control: Object })
 const emit = defineEmits(['error', 'settings', 'refresh'])
+const view = ref('list')
 const query = ref(''), sort = ref('rss'), processes = ref(), detail = ref(''), detailTab = ref('metrics'), trend = ref('rss'), stopping = ref(null), working = ref(false)
 const selected = computed(() => props.memory.selected || {})
 const info = computed(() => selected.value.details || {})
@@ -42,7 +44,7 @@ const summaryItems = computed(() => [
 const metricLabels = { rss: '驻留内存 RSS', uss: '私有驻留 USS', pss: '比例分摊 PSS', anonymous: '匿名内存', file_pss: '文件映射 PSS', shared_pss: '共享内存 PSS', swap: '交换占用', private_commit: '私有提交', cpu_percent: 'CPU · 整机', cpu_user_percent: '用户态 · 整机', cpu_system_percent: '内核态 · 整机', read_bps: '读取字节速率', write_bps: '写入字节速率', read_iops: '读取操作速率', write_iops: '写入操作速率', read_chars_bps: '逻辑读取速率', write_chars_bps: '逻辑写入速率', threads: '线程数', resources: 'FD / 句柄', ctx_voluntary_rate: '主动上下文切换', ctx_involuntary_rate: '被动上下文切换' }
 const metricEntries = computed(() => Object.entries(metricLabels).map(([key, label]) => ({ key, label, value: formatMetric(key, metrics.value[key]) })))
 function formatMetric(key, value) { if (value == null) return '—'; return key.includes('percent') ? percentage(value) : key.endsWith('_bps') ? `${size(value)}/秒` : ['threads', 'resources'].includes(key) || key.endsWith('iops') || key.endsWith('_rate') ? number(value) : size(value) }
-const load = page => call('process_rows', { ...page, query: query.value, sort: sort.value })
+const load = page => call('process_rows', { ...page, query: query.value, sort: sort.value, tree: view.value === 'tree' })
 const localLoad = computed(() => {
   const rows = detailTab.value === 'threads' ? report.value.threads || [] : detailTab.value === 'files' ? report.value.open_files || [] : detailTab.value === 'trace' ? trace.value.events || [] : report.value.mappings || []
   return async ({ offset, limit }) => ({ total: rows.length, rows: rows.slice(offset, offset + limit) })
@@ -64,10 +66,10 @@ defineExpose({ refresh: () => processes.value?.reload(false) })
     <div class="memory-columns">
       <section class="panel process-panel">
         <div class="section-heading"><h2>进程</h2><span class="muted">{{ number(memory.process_count) }} 个</span></div>
-        <div class="toolbar"><input v-model="query" aria-label="搜索进程" placeholder="搜索进程名称或 PID"><ClickSelect v-model="sort" label="进程排序" :options="[{value:'rss',label:'内存占用'},{value:'delta',label:'内存变化'},{value:'name',label:'名称'},{value:'pid',label:'PID'}]"/></div>
+        <div class="toolbar"><ClickSelect v-model="view" label="进程视图" :options="[{value:'list',label:'进程列表'},{value:'tree',label:'进程树'}]"/><input v-model="query" aria-label="搜索进程" placeholder="搜索进程名称或 PID"><ClickSelect v-model="sort" label="进程排序" :options="[{value:'rss',label:'内存占用'},{value:'delta',label:'内存变化'},{value:'name',label:'名称'},{value:'pid',label:'PID'}]"/></div>
         <div class="list-header process-grid"><span>进程 / PID</span><span>内存</span><span>变化</span></div>
-        <VirtualList ref="processes" row-key="id" :load="load" :revision="query + sort" @visible="visibleIcons" empty="没有匹配的进程">
-          <template #default="{row}"><button class="data-row process-grid" :class="{selected:sameKey(row.key, selected.key)}" @click="select(row)"><span class="process-name"><img v-if="icons[row.id]" class="process-icon" :src="icons[row.id]" alt=""><svg v-else class="process-icon fallback-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg><span class="truncate"><b>{{ row.name }}</b><small>PID {{ row.key?.[0] }} · {{ number(row.seconds) }} 秒</small></span></span><span>{{ size(row.rss) }}</span><span :class="{'positive':row.delta > 0}">{{ row.delta > 0 ? '+' : '' }}{{ size(row.delta) }}</span></button></template>
+        <VirtualList ref="processes" row-key="id" :load="load" :revision="query + sort + view" @visible="visibleIcons" empty="没有匹配的进程">
+          <template #default="{row}"><button class="data-row process-grid" :class="{selected:sameKey(row.key, selected.key)}" @click="select(row)"><span class="process-name" :style="view === 'tree' ? {paddingLeft: Math.min(row.depth || 0, 8) * 12 + 'px'} : undefined"><img v-if="icons[row.id]" class="process-icon" :src="icons[row.id]" alt=""><svg v-else class="process-icon fallback-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg><span class="truncate"><b>{{ row.name }}</b><small>PID {{ row.key?.[0] }} · {{ number(row.seconds) }} 秒</small></span></span><span>{{ size(row.rss) }}</span><span :class="{'positive':row.delta > 0}">{{ row.delta > 0 ? '+' : '' }}{{ size(row.delta) }}</span></button></template>
         </VirtualList>
       </section>
       <div class="process-right">
@@ -78,6 +80,7 @@ defineExpose({ refresh: () => processes.value?.reload(false) })
           <p v-else class="muted">从左侧选择，开始采样并查看诊断依据。</p><p v-if="selected.message" class="inline-note" role="status">{{ selected.message }}</p>
         </section>
         <AiPanel :state="ai?.mode === 'cleanup' ? {} : ai" :has-key="boot.has_key" :selected="!!selected.key && !!selected.summary" @settings="emit('settings')" @error="emit('error',$event)"/>
+        <ProcessGovernance v-if="selected.key" :memory="memory" :state="control || {}" :boot="boot" @error="emit('error',$event)" @refresh="emit('refresh')"/>
       </div>
     </div>
     <Teleport to="body"><div v-if="detail" class="modal-backdrop" @click.self="detail = ''"><section class="modal wide" role="dialog" aria-modal="true" aria-label="进程资源明细"><div class="section-heading"><h2>{{ selected.name }} · 资源明细</h2><button @click="detail = ''" aria-label="关闭">✕</button></div><div class="tabs compact"><button v-for="[value,label] in [['metrics','概览'],['threads','线程'],['files','打开文件'],['mappings','内存映射'],['trend','趋势'],['findings','依据'],...(boot.can_trace ? [['trace','文件跟踪']] : [])]" :key="value" :class="{active:detailTab === value}" @click="detailTab = value">{{ label }}</button></div>

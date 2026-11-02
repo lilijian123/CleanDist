@@ -1,5 +1,6 @@
 """只读空间统计和分阶段内容比对，不提供自动删除。"""
-from collections import defaultdict
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
@@ -147,18 +148,13 @@ def analyze_usage(snapshot, cancel=None, progress=None):
 
 
 SAMPLE_BYTES = 16 * 1024
-HEADER_BYTES = 4 * 1024
 SMALL_FULL_BYTES = 64 * 1024
 
 
-def file_digest(record, cancel, sample, seen=None):
+def file_digest(record, cancel, sample):
     digest = hashlib.sha256()
     with checked_file(record, cancel) as (stream, live):
-        if seen is not None and (live.device, live.inode) in seen:
-            return None, live
-        if sample == 'head' and live.size > SMALL_FULL_BYTES:
-            digest.update(stream.read(HEADER_BYTES))
-        elif sample and live.size > SMALL_FULL_BYTES:
+        if sample and live.size > SMALL_FULL_BYTES:
             tail = live.size - SAMPLE_BYTES
             for offset in (0, tail // 2, tail):
                 if cancel.is_set():
@@ -176,7 +172,33 @@ def file_digest(record, cancel, sample, seen=None):
     return digest.digest(), live
 
 
-def find_duplicates(snapshot, cancel=None, progress=None, *, minimum_bytes=1):
+def _hash_files(records, cancel, sample, executor, workers):
+    def read(record):
+        try:
+            digest, live = file_digest(record, cancel, sample)
+            return digest, live, None
+        except (OSError, ValueError, Cancelled) as error:
+            return None, record, error
+
+    if workers == 1:
+        for record in records:
+            if cancel.is_set(): break
+            yield read(record)
+        return
+    remaining, pending = iter(records), deque()
+    try:
+        while not cancel.is_set():
+            while len(pending) < workers * 2:
+                record = next(remaining, None)
+                if record is None: break
+                pending.append(executor.submit(read, record))
+            if not pending: break
+            yield pending.popleft().result()
+    finally:
+        for future in pending: future.cancel()
+
+
+def find_duplicates(snapshot, cancel=None, progress=None, *, minimum_bytes=1, workers=None):
     if minimum_bytes < 1:
         raise ValueError('最小文件大小必须大于0')
     cancel = cancel or threading.Event()
@@ -188,58 +210,56 @@ def find_duplicates(snapshot, cancel=None, progress=None, *, minimum_bytes=1):
             return result
         if record.size >= minimum_bytes:
             sizes[record.size].append(record)
-    candidates = [record for group in sizes.values() if len(group) > 1 for record in group]
-    headers = defaultdict(list)
+    candidates = []
+    for group in sizes.values():
+        if len(group) < 2:
+            continue
+        identities, unique = set(), []
+        for record in sorted(group, key=lambda item: str(item.path).casefold()):
+            identity = record.device, record.inode
+            if record.inode and record.device:
+                if identity in identities:
+                    result.hardlinks += 1
+                    continue
+                identities.add(identity)
+            unique.append(record)
+        if len(unique) > 1:
+            candidates.extend(unique)
     samples = defaultdict(list)
     hashes = defaultdict(list)
     seen = set()
-    for index, record in enumerate(sorted(candidates, key=lambda record: record.relative.casefold())):
-        if cancel.is_set():
-            break
-        try:
-            digest, live = file_digest(record, cancel, 'head', seen)
-            identity = live.device, live.inode
-            if digest is None:
-                result.hardlinks += 1
-                continue
-            seen.add(identity)
-            # 小文件在首次打开时已完整读取，不能再走第二轮完整哈希。
-            if live.size <= SMALL_FULL_BYTES:
-                hashes[(live.size, digest)].append(live)
-            else:
-                headers[(live.size, digest)].append(live)
-            result.checked += 1
-        except Cancelled:
-            break
-        except (OSError, ValueError) as error:
-            note_error(result, record, error)
-        if progress and index % 16 == 0:
-            progress('快速比对文件头', index + 1, len(candidates))
-    middle = [record for group in headers.values() if len(group)>1 for record in group]
-    for index, record in enumerate(middle):
-        if cancel.is_set(): break
-        try:
-            digest, live = file_digest(record, cancel, True)
-            samples[(live.size, digest)].append(live)
-        except Cancelled:
-            break
-        except (OSError, ValueError) as error:
-            note_error(result, record, error)
-        if progress and index % 16 == 0:
-            progress('筛选内容指纹', index + 1, len(middle))
-    full = [record for group in samples.values() if len(group) > 1 for record in group]
-    for index, record in enumerate(full):
-        if cancel.is_set():
-            break
-        try:
-            if progress:
-                progress(f'完整比对 · {record.relative}', index, len(full))
-            digest, live = file_digest(record, cancel, False)
-            hashes[(live.size, digest)].append(live)
-        except Cancelled:
-            break
-        except (OSError, ValueError) as error:
-            note_error(result, record, error)
+    if workers is None:
+        roots = snapshot.roots if hasattr(snapshot, 'roots') else (snapshot.root,)
+        workers = min((system.duplicate_workers(root) for root in roots), default=1)
+    if type(workers) is not int or not 1 <= workers <= 4:
+        raise ValueError('内容比对并发数应为1至4')
+    workers = min(workers, os.cpu_count() or 1, max(1, len(candidates)))
+    # One open for head/middle/tail sampling; bounded work avoids a future per file.
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for sample, stage in ((True, '筛选内容指纹'), (False, '完整内容校验')):
+            records = (sorted(candidates, key=lambda record: str(record.path).casefold()) if sample else
+                       [record for group in samples.values() if len(group) > 1 for record in group])
+            if progress: progress(stage, 0, len(records))
+            for index, (digest, live, error) in enumerate(_hash_files(records, cancel, sample, executor, workers)):
+                if isinstance(error, Cancelled):
+                    cancel.set()
+                    break
+                if error is not None:
+                    note_error(result, live, error)
+                elif sample:
+                    identity = live.device, live.inode
+                    if identity in seen:
+                        result.hardlinks += 1
+                    else:
+                        seen.add(identity)
+                        target = hashes if live.size <= SMALL_FULL_BYTES else samples
+                        target[(live.size, digest)].append(live)
+                        result.checked += 1
+                else:
+                    hashes[(live.size, digest)].append(live)
+                if progress and (index % 16 == 0 or index + 1 == len(records)):
+                    progress(stage, index + 1, len(records))
+            if cancel.is_set(): break
     confirmed = []
     for group in hashes.values():
         if len(group) < 2 or cancel.is_set():
@@ -251,7 +271,7 @@ def find_duplicates(snapshot, cancel=None, progress=None, *, minimum_bytes=1):
             except (OSError, ValueError) as error:
                 note_error(result, record, error)
         if len(valid) > 1:
-            confirmed.append(tuple(valid))
+            confirmed.append(tuple(sorted(valid, key=lambda record: str(record.path).casefold())))
     result.cancelled = cancel.is_set()
     result.groups = () if result.cancelled else tuple(sorted(
         confirmed, key=lambda group: (-group[0].size * (len(group) - 1), group[0].relative)))

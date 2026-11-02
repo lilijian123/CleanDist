@@ -1,4 +1,6 @@
 """Linux 适配入口：XDG应用、inotify通知与安全的单进程SIGTERM。"""
+import os
+from pathlib import Path
 from ..common import (
     FONT_FAMILY, SCAN_NAME, is_link, list_disks, process_options,
     python_executable, recycle, scan_native, allocated_bytes, open_metadata, context_counters,
@@ -29,3 +31,17 @@ def process_counter(process):
 
 def private_memory(process, memory):
     return process.memory_full_info().uss
+
+
+def duplicate_workers(root):
+    try:
+        number = Path(root).stat().st_dev
+        device = Path('/sys/dev/block') / f'{os.major(number)}:{os.minor(number)}'
+        resolved = device.resolve()
+        for parent in (resolved, resolved.parent):
+            rotational = parent / 'queue/rotational'
+            if rotational.exists():
+                return 4 if rotational.read_text().strip() == '0' else 1
+    except OSError:
+        pass
+    return 1

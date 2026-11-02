@@ -20,9 +20,16 @@ class AiService:
         self._lock = threading.RLock()
         self._generation, self._closed, self._response = 0, False, None
         self._state = {'busy': False, 'text': '', 'error': '', 'target': '', 'mode': '', 'request': 0}
+        self._payload = None
 
     def state(self):
         with self._lock: return dict(self._state)
+
+    def request_data(self, request):
+        with self._lock:
+            if request != self._state['request'] or self._payload is None:
+                raise ValueError('该次请求已失效，请查看当前分析请求')
+            return json.loads(self._payload)
 
     def ask(self, summary, mode, key, model, target):
         if not key: raise ValueError('请先在设置中保存 DeepSeek API Key。')
@@ -33,6 +40,7 @@ class AiService:
             if self._closed: raise ValueError('应用已关闭')
             self._generation += 1
             generation = self._generation
+            self._payload = json.dumps(payload, ensure_ascii=False, allow_nan=False)
             self._state = {'busy': True, 'text': '', 'error': '', 'target': str(target), 'mode': mode, 'request': generation}
         threading.Thread(target=self._run, args=(generation, payload, key), daemon=True).start()
         return self.state()
@@ -98,3 +106,4 @@ class AiService:
             if self._state['mode'] not in ('analyze', 'predict'): return
             self.cancel()
             self._state = {'busy': False, 'text': '', 'error': '', 'target': '', 'mode': '', 'request': self._generation}
+            self._payload = None

@@ -4,6 +4,7 @@
 """
 from collections import deque
 from dataclasses import dataclass
+import sys
 import time
 
 import psutil
@@ -16,6 +17,7 @@ class ProcessSample:
     created: float
     name: str
     rss: int | None
+    parent_pid: int | None = None
 
     @property
     def key(self):
@@ -30,6 +32,7 @@ class ProcessReading:
     delta: int | None
     observed_seconds: float
     points: tuple
+    parent_key: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -48,12 +51,15 @@ class MemoryHistory:
 
     def update(self, samples, now):
         active = {sample.key for sample in samples}
+        identities = {sample.pid: sample.key for sample in samples}
         self.histories = {key: points for key, points in self.histories.items() if key in active}
         rows = []
         for sample in samples:
+            parent = identities.get(sample.parent_pid)
+            if parent is not None and (parent == sample.key or parent[1] > sample.created): parent = None
             points = self.histories.setdefault(sample.key, deque(maxlen=122))
             if sample.rss is None:
-                rows.append(ProcessReading(sample.key, sample.name, None, None, 0, tuple(points)))
+                rows.append(ProcessReading(sample.key, sample.name, None, None, 0, tuple(points), parent))
                 continue
             points.append((now, sample.rss))
             cutoff = now - 60
@@ -62,7 +68,7 @@ class MemoryHistory:
                 points.popleft()
             rows.append(ProcessReading(
                 sample.key, sample.name, sample.rss,
-                sample.rss - points[0][1], max(0, now - points[0][0]), tuple(points),
+                sample.rss - points[0][1], max(0, now - points[0][0]), tuple(points), parent,
             ))
         return sorted(rows, key=lambda row: (row.rss is not None, row.rss or 0), reverse=True)
 
@@ -71,8 +77,12 @@ def sample_memory(history):
     memory = psutil.virtual_memory()
     samples = []
     unreadable = 0
-    for process in psutil.process_iter(['pid', 'name', 'create_time', 'memory_info'], ad_value=None):
+    for process in psutil.process_iter(['pid', 'name', 'create_time', 'memory_info', 'ppid'], ad_value=None):
         try:
+            # psutil process_iter caches Process objects on Windows. A reused PID
+            # must not contribute its cached creation identity to the parent tree.
+            if sys.platform == 'win32' and not process.is_running():
+                continue
             data = process.info
             if data['create_time'] is None:
                 unreadable += 1
@@ -82,7 +92,7 @@ def sample_memory(history):
                 unreadable += 1
             samples.append(ProcessSample(
                 data['pid'], system.process_created(process), data['name'] or f"进程 {data['pid']}",
-                info.rss if info is not None else None,
+                info.rss if info is not None else None, data.get('ppid'),
             ))
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError, ValueError):
             unreadable += 1
