@@ -104,10 +104,29 @@ class DesktopApi:
             'portable_preview': self._dependencies.portable_preview,
         }
         if action in routes: return routes[action](**data)
-        if action == 'pick_folder':
+        if action == 'block_trace':
+            return self._processes.block_trace(**data)
+        if action == 'block_trace_export':
+            contents = self._processes.block_trace_export(**data)
             if self._window is None: raise ValueError('桌面窗口尚未就绪')
             import webview
-            result = self._window.create_file_dialog(webview.FileDialog.FOLDER)
+            device = data['device'].replace(':', '-')
+            result = self._window.create_file_dialog(webview.FileDialog.SAVE,
+                save_filename=f"io-{device}.trace")
+            if not result:
+                return None
+            path = Path(result[0])
+            try:
+                with path.open('x', encoding='ascii', newline='\n') as stream:
+                    stream.write(contents)
+            except FileExistsError as error:
+                raise ValueError('文件已存在，请选择新的文件名') from error
+            return {'path': str(path), 'count': contents.count('\n')}
+        if action in ('pick_folder', 'pick_trace_file'):
+            if self._window is None: raise ValueError('桌面窗口尚未就绪')
+            import webview
+            kind = webview.FileDialog.FOLDER if action == 'pick_folder' else webview.FileDialog.OPEN
+            result = self._window.create_file_dialog(kind)
             return str(result[0]) if result else None
         if action == 'ai':
             with self._lock:

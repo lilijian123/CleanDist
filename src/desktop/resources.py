@@ -6,6 +6,8 @@ from pathlib import Path
 import threading
 import time
 
+import psutil
+
 from ..core.ai import summarize_report
 from ..core.memory import MemoryHistory, sample_memory
 from ..core.process_analysis import AnalysisHistory, sample_analysis
@@ -74,6 +76,7 @@ class ProcessService:
         self._details = self._previous_details = self._report = None
         self._sample_at = None
         self._trace = None
+        self._block_trace = None
         self._trace_requested = False
         self._trace_listener = None
         self._trace_seen = set()
@@ -206,9 +209,9 @@ class ProcessService:
                       'process_count': len(self._rows),
                       'updated': snapshot.timestamp if snapshot else None, 'selected': None}
             if self._key:
+                row = next((row for row in self._rows if row.key == self._key), None)
                 details = _json(self._details) if self._details else None
                 if details is not None:
-                    row = next((row for row in self._rows if row.key == self._key), None)
                     details['memory'] = _json(summarize_memory(row.points)) if row else None
                     details['cpu_percent'] = cpu_percentage(self._previous_details, self._details)
                 try:
@@ -216,8 +219,10 @@ class ProcessService:
                 except ValueError:
                     summary = None
                 result['selected'] = {'key': list(self._key), 'name': self._name,
-                    'details': details, 'report': _report_json(self._report) if self._report else None,
-                    'summary': summary, 'trace': self._trace_state(), 'message': self._message}
+                    'rss': row.rss if row else None, 'details': details,
+                    'report': _report_json(self._report) if self._report else None,
+                    'summary': summary, 'trace': self._trace_state(), 'message': self._message,
+                    'block_trace': self._block_trace.snapshot() if self._block_trace else None}
                 result['selected']['report_time_offset'] = time.time() - time.monotonic()
             return _json(result)
 
@@ -270,13 +275,21 @@ class ProcessService:
             row = next((row for row in self._rows if row.key == key), None)
             if row is None:
                 raise ValueError('进程不在已采样列表中，请刷新后重选')
-        matching_process(key)
+        try:
+            matching_process(key)
+        except psutil.NoSuchProcess as error:
+            raise ValueError('进程已退出，请重新选择') from error
+        except psutil.AccessDenied as error:
+            raise ValueError('没有权限查看该进程') from error
         with self._lock:
             if self._closed.is_set():
                 raise ValueError('资源服务已关闭')
             if self._stopping and key != self._key:
                 raise ValueError('请等待当前进程结束请求返回后再切换')
             if key != self._key:
+                if self._block_trace is not None:
+                    self._block_trace.close()
+                    self._block_trace = None
                 old_trace, self._trace = self._trace, None
                 self._trace_requested = False
                 self._trace_seen.clear()
@@ -382,12 +395,45 @@ class ProcessService:
         with self._lock:
             self._closed.set()
             self._generation += 1
+            if self._block_trace is not None:
+                self._block_trace.close()
             if self._trace is not None:
                 self._trace.close()
                 self._trace = None
         self._fast_wake.set()
         self._deep_wake.set()
         self._icon_wake.set()
+
+    def block_trace(self, key, enabled, path=None):
+        if system.NAME != 'Linux':
+            raise ValueError('块 I/O 追踪仅支持 Linux')
+        if type(enabled) is not bool:
+            raise ValueError('无效的追踪开关')
+        if path is not None and (not isinstance(path, str) or not Path(path).is_absolute() or '\x00' in path):
+            raise ValueError('请选择绝对路径的文件')
+        key = _key(key)
+        from ..platforms.linux.block_trace import BlockTrace
+        with self._lock:
+            if self._closed.is_set() or key != self._key:
+                raise ValueError('请重新选择要追踪的进程')
+            if enabled and (self._block_trace is None or not self._block_trace.active):
+                self._block_trace = BlockTrace(key, path)
+                self._block_trace.start()
+            elif not enabled and self._block_trace is not None:
+                self._block_trace.close()
+            return self._block_trace.snapshot() if self._block_trace else None
+
+    def block_trace_export(self, key, device):
+        if system.NAME != 'Linux':
+            raise ValueError('块 I/O 追踪仅支持 Linux')
+        key = _key(key)
+        from ..platforms.linux.block_trace import mqsim_text
+        with self._lock:
+            capture = self._block_trace
+            if key != self._key or capture is None or capture.active:
+                raise ValueError('请先完成当前进程的块 I/O 采集')
+            rows = capture.rows
+        return mqsim_text(rows, device)
 
 
 class AppService:
