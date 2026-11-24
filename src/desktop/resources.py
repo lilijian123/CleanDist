@@ -314,9 +314,9 @@ class ProcessService:
         with self._lock:
             return self._summary()
 
-    def stop(self, key, force=False, confirmed=False):
+    def stop(self, key, force=False, confirmed=False, descendants=False):
         key = _key(key)
-        if confirmed is not True or type(force) is not bool:
+        if confirmed is not True or type(force) is not bool or type(descendants) is not bool:
             raise ValueError('结束进程需要明确确认')
         if force and not getattr(system, 'CAN_FORCE_STOP', False):
             raise ValueError('当前平台不支持强制结束')
@@ -329,7 +329,10 @@ class ProcessService:
             self._stopping = True
             self._message = '正在发送结束请求，尚未确认退出'
         try:
-            result = system.stop_process(key, force=True) if force else system.stop_process(key)
+            options = {"force": True} if force else {}
+            if descendants:
+                options["descendants"] = True
+            result = system.stop_process(key, **options)
             with self._lock:
                 if self._current(key, generation):
                     self._message = result.message
@@ -404,20 +407,22 @@ class ProcessService:
         self._deep_wake.set()
         self._icon_wake.set()
 
-    def block_trace(self, key, enabled, path=None):
+    def block_trace(self, key, enabled, path=None, whole_device=False):
         if system.NAME != 'Linux':
             raise ValueError('块 I/O 追踪仅支持 Linux')
         if type(enabled) is not bool:
             raise ValueError('无效的追踪开关')
         if path is not None and (not isinstance(path, str) or not Path(path).is_absolute() or '\x00' in path):
             raise ValueError('请选择绝对路径的文件')
+        if type(whole_device) is not bool or (whole_device and not path):
+            raise ValueError('请选择目标设备上的文件')
         key = _key(key)
         from ..platforms.linux.block_trace import BlockTrace
         with self._lock:
             if self._closed.is_set() or key != self._key:
                 raise ValueError('请重新选择要追踪的进程')
             if enabled and (self._block_trace is None or not self._block_trace.active):
-                self._block_trace = BlockTrace(key, path)
+                self._block_trace = BlockTrace(key, path, whole_device)
                 self._block_trace.start()
             elif not enabled and self._block_trace is not None:
                 self._block_trace.close()
@@ -432,6 +437,8 @@ class ProcessService:
             capture = self._block_trace
             if key != self._key or capture is None or capture.active:
                 raise ValueError('请先完成当前进程的块 I/O 采集')
+            if capture.partial:
+                raise ValueError('采集不完整，无法导出')
             rows = capture.rows
         return mqsim_text(rows, device)
 

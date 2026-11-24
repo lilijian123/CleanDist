@@ -1,4 +1,4 @@
-"""通过 pidfd 对已验证身份的单个进程发送 SIGTERM，不升级为强制结束。"""
+"""通过 pidfd 对已验证身份的进程发送用户选择的 SIGTERM 或 SIGKILL。"""
 import errno
 import os
 import select
@@ -6,10 +6,10 @@ import signal
 
 import psutil
 
-from ...core.processes import matching_process, StopResult
+from ...core.processes import matching_process, StopResult, stop_descendants
 
 
-def stop_process(key):
+def stop_process(key, *, force=False, descendants=False):
     pid, _ = key
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         raise ValueError('无效的PID')
@@ -39,10 +39,12 @@ def stop_process(key):
             raise ProcessLookupError('进程已经退出，请刷新列表') from error
         if poller.poll(0):
             raise ProcessLookupError('进程已经退出，请刷新列表')
+        if descendants:
+            return stop_descendants(key, lambda target: stop_process(target, force=force))
         try:
-            signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+            signal.pidfd_send_signal(descriptor, signal.SIGKILL if force else signal.SIGTERM)
         except PermissionError as error:
-            raise PermissionError('没有权限发送普通结束请求；未提权或强制结束') from error
+            raise PermissionError('没有权限发送结束信号') from error
         except ProcessLookupError as error:
             raise ProcessLookupError('进程在结束请求前已经退出，请刷新列表') from error
         except OSError as error:
@@ -50,7 +52,8 @@ def stop_process(key):
                 raise OSError('当前内核不支持安全的 pidfd 信号；未使用 PID 结束') from error
             raise
         exited = bool(poller.poll(1500))
-        message = '进程已结束' if exited else '已发送普通结束请求，进程尚未退出，请查看该程序的提示'
+        mode = '强制' if force else '普通'
+        message = '进程已结束' if exited else f'已发送{mode}结束请求，进程尚未退出'
         return StopResult(key, exited, message)
     finally:
         os.close(descriptor)

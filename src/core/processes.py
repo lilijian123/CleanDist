@@ -64,6 +64,48 @@ def matching_process(key):
     return process
 
 
+def stop_descendants(key, stop_one):
+    from ..platforms import system
+    import os
+
+    root = matching_process(key)
+    children = root.children(recursive=True)
+    if any(child.pid == os.getpid() for child in children):
+        raise ValueError('所选进程树包含本应用，已取消结束请求')
+    targets = []
+    gone = pending = failed = 0
+    errors = []
+    for child in reversed(children):
+        try:
+            identity = (child.pid, system.process_created(child))
+            if child.is_running():
+                targets.append(identity)
+            else:
+                gone += 1
+        except psutil.NoSuchProcess:
+            gone += 1
+        except (psutil.AccessDenied, PermissionError) as error:
+            failed += 1
+            if len(errors) < 3:
+                errors.append(f'PID {child.pid}：无法核对身份，{error}')
+    for target in [*targets, key]:
+        try:
+            if stop_one(target).exited:
+                gone += 1
+            else:
+                pending += 1
+        except (psutil.NoSuchProcess, ProcessLookupError):
+            gone += 1
+        except (ValueError, OSError, psutil.Error) as error:
+            failed += 1
+            if len(errors) < 3:
+                errors.append(f'PID {target[0]}：{error}')
+    message = f'进程树共 {len(children) + 1} 个，已退出 {gone} 个，等待退出 {pending} 个，失败 {failed} 个'
+    if errors:
+        message += '。' + '；'.join(errors)
+    return StopResult(key, not (pending or failed), message)
+
+
 def sample_process_details(key):
     from ..platforms import system
     process = matching_process(key)

@@ -10,16 +10,13 @@ import threading
 import time
 
 from ..core.cleanup import classify_cleanup
-from ..core.files import scan_directory, validate_plain_path
+from ..core.files import scan_directory, stat_identity, validate_plain_path
 from ..platforms import system
 
+_RESIDUE = object()  # Only the package service can supply this provenance.
 
 def _inside(path, root):
     return path == root or root in path.parents
-
-
-def _identity(info):
-    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
 
 
 class DirectoryService:
@@ -101,7 +98,7 @@ class DirectoryService:
                         item['status'] = 'attention'
                 elif item['status'] == 'restoring' and not os.path.lexists(vault):
                     target = Path(item.get('destination', item['original']))
-                    if target.exists() and _identity(target.lstat())[:2] == item['manifest']['.'][:2]:
+                    if target.exists() and stat_identity(target.lstat())[:2] == item['manifest']['.'][:2]:
                         item['status'] = 'restored'
                     else:
                         item['status'] = 'attention'
@@ -246,7 +243,7 @@ class DirectoryService:
         info = path.lstat()
         if not info.st_ino or not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
             raise ValueError('仅支持身份可确认的普通文件或独立目录')
-        manifest = {'.': _identity(info)}
+        manifest = {'.': stat_identity(info)}
         if path.is_dir():
             snapshot = scan_directory(path, cancel=self._stop, backend='python')
             if not snapshot.complete:
@@ -255,7 +252,7 @@ class DirectoryService:
                 directory = path / relative
                 if os.path.ismount(directory):
                     raise ValueError('目录包含挂载点，不支持整目录回收')
-                manifest[relative + '/'] = _identity(directory.lstat())
+                manifest[relative + '/'] = stat_identity(directory.lstat())
             manifest.update({relative: [record.device, record.inode, record.size, record.modified_ns, record.ctime_ns]
                              for relative, record in snapshot.files.items()})
             # 与目录项保持相同的 dev/inode/size/mtime/ctime 顺序。
@@ -267,10 +264,12 @@ class DirectoryService:
             size = info.st_size
         return manifest, size, classify_cleanup(snapshot)
 
-    def _vault_directory(self, path):
+    def _vault_directory(self, path, residue=False):
         suffix = hashlib.sha256(str(self._state_dir).encode()).hexdigest()[:12]
         containing = next((Path(item['path']) for item in self._roots.values() if _inside(path, Path(item['path']))), path)
-        candidates = [self._state_dir / 'vault', containing.parent / ('.cleandist-vault-' + suffix)]
+        candidates = [self._state_dir / 'vault']
+        if not residue:
+            candidates.append(containing.parent / ('.cleandist-vault-' + suffix))
         for candidate in candidates:
             if any(_inside(candidate, Path(item['path'])) for item in self._roots.values()):
                 continue
@@ -283,10 +282,10 @@ class DirectoryService:
                     return candidate
             except (OSError, ValueError):
                 continue
-        raise ValueError('没有可写且位于监测目录之外的同卷应用回收目录')
+        raise ValueError('应用回收站与残留文件不在同卷或不可写' if residue else '没有可写且位于监测目录之外的同卷应用回收目录')
 
     def preview(self, paths, source='quota'):
-        if source not in ('quota', 'portable') or not isinstance(paths, list) or not paths or any(not isinstance(path, str) for path in paths):
+        if source not in ('quota', 'portable', _RESIDUE) or not isinstance(paths, list) or not paths or any(not isinstance(path, str) for path in paths):
             raise ValueError('请选择需要回收的路径')
         with self._lock:
             chosen = [validate_plain_path(path).resolve() for path in paths]
@@ -307,14 +306,26 @@ class DirectoryService:
                 manifest, size, analysis = self._capture(path)
                 if any(item.risk == 'high' for item in analysis.items):
                     raise ValueError('高风险内容仅供查看，不支持回收')
-                vault = self._vault_directory(path)
-                entries.append(dict(original=str(path), bytes=size, manifest=manifest, vault_root=str(vault), source=source))
+                vault = self._vault_directory(path, residue=source is _RESIDUE)
+                entries.append(dict(original=str(path), bytes=size, manifest=manifest, vault_root=str(vault),
+                                    source='residue' if source is _RESIDUE else source))
                 notes.extend(dict(name=item.name, risk=item.risk, reason=item.reason) for item in analysis.items)
             token = secrets.token_urlsafe(24)
-            self._previews = {token: entries}
+            if source is _RESIDUE:
+                self._previews[token] = entries
+            else:
+                self._previews = {token: entries}
             return dict(token=token, count=len(entries), bytes=sum(item['bytes'] for item in entries), notes=notes,
                         files=[dict(path=item['original'], bytes=item['bytes']) for item in entries],
                         message='移入本应用回收站，同卷回收不会释放磁盘空间；永久删除需另行确认。')
+
+    def recycle_residue(self, path, identity):
+        with self._lock:
+            token = self.preview([path], source=_RESIDUE)['token']
+            if self._previews[token][0]['manifest'] != {'.': identity}:
+                self._previews.pop(token)
+                raise ValueError('残留文件已更换或修改')
+            return self.recycle(token, confirmed=True)
 
     def recycle(self, token, confirmed=False):
         with self._lock:

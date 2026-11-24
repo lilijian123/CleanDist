@@ -12,6 +12,9 @@ import subprocess
 import threading
 import uuid
 
+from ..platforms.uninstall_residues import (apt_manifest, apt_owner, appx_cache, file_identity,
+                                 desktop_manifest, desktop_shared,
+                                 user_cache_manifest, cache_files, cache_status, check_user_cache)
 
 # Run the distribution's Python, not a venv: Ubuntu ships python3-apt there.
 # target_versions is APT's version/alternative/virtual-package resolution.
@@ -22,6 +25,11 @@ rows = []
 for package in cache:
     version = package.installed
     if version is None:
+        if package.has_config_files:
+            rows.append({'id': 'dpkg-rc:' + package.fullname, 'name': package.fullname,
+                'source': 'APT', 'config_only': True, 'essential': package.essential,
+                'native': package.architecture() == native, 'version': '',
+                'dependencies': [], 'dependency_groups': [], 'auto': False})
         continue
     groups = []
     for group in version.get_dependencies('Depends', 'PreDepends'):
@@ -45,7 +53,7 @@ $rows = @()
 foreach ($p in @(Get-AppxPackage)) {
     $rows += @{id=('appx:'+$p.PackageFullName); name=$p.Name; version=$p.Version.ToString();
         source='AppX'; dependencies=@($p.Dependencies | ForEach-Object {'appx:'+$_.PackageFullName});
-        package_full_name=$p.PackageFullName; framework=[bool]$p.IsFramework;
+        package_full_name=$p.PackageFullName; package_family_name=$p.PackageFamilyName; framework=[bool]$p.IsFramework;
         system=[bool]$p.NonRemovable; path=$p.InstallLocation}
 }
 $seen = @{}
@@ -63,7 +71,7 @@ foreach ($hive in @([Microsoft.Win32.RegistryHive]::LocalMachine,[Microsoft.Win3
                     $seen[$identity]=$true
                     $rows += @{id=('desktop:'+$identity); name=$display;
                         version=[string]$item.GetValue('DisplayVersion'); source='Desktop'; dependencies=$null;
-                        uninstall_command=[string]$item.GetValue('UninstallString');
+                        uninstall_command=[string]$item.GetValue('UninstallString'); display_icon=[string]$item.GetValue('DisplayIcon');
                         path=[string]$item.GetValue('InstallLocation')}
                 }
                 $item.Dispose()
@@ -77,14 +85,31 @@ ConvertTo-Json -InputObject @($rows) -Depth 6 -Compress
 '''
 
 
+class ResiduePreview:
+    def __init__(self, entries, notes, complete=True):
+        self.token = uuid.uuid4().hex
+        self.entries = {uuid.uuid4().hex: entry for entry in entries}
+        self.notes = notes
+        self.complete = complete
+
+    def public(self, include_items=True):
+        result = dict(token=self.token, count=len(self.entries), notes=self.notes, complete=self.complete)
+        if include_items:
+            result['items'] = [dict(id=key, path=item['path'], owner=item['owner'], bytes=item['identity'][2],
+                                    evidence=item['evidence']) for key, item in self.entries.items()]
+        return result
+
+
 class DependencyService:
-    def __init__(self, recycle_preview=None, *, state_dir=None, runner=None, platform=None):
+    def __init__(self, recycle_preview=None, *, recycle_residue=None, state_dir=None, runner=None, platform=None):
         self._platform = platform or host_platform.system()
         root = Path(state_dir) if state_dir is not None else (
             Path(os.environ.get('LOCALAPPDATA') or Path.home() / '.local/share') / 'CleanDist')
         self._path = root / 'portable-apps.json'
         self._runner = runner
         self._recycle_preview = recycle_preview
+        self._recycle_residue = recycle_residue
+        self._residues = None
         self._lock = threading.RLock()
         self._rows, self._portable, self._previews = {}, {}, {}
         self._busy, self._closed, self._thread = False, False, None
@@ -294,14 +319,15 @@ class DependencyService:
         return {key: value for key, value in row.items()
                 if key not in ('uninstall_command', 'reverse_ids')}
 
-    def rows(self, offset=0, limit=100, query='', orphans=False):
+    def rows(self, offset=0, limit=100, query='', orphans=False, config_only=False):
         if (type(offset) is not int or type(limit) is not int or offset < 0 or limit < 1
-                or not isinstance(query, str) or type(orphans) is not bool):
+                or not isinstance(query, str) or type(orphans) is not bool or type(config_only) is not bool):
             raise ValueError('无效的依赖列表参数')
         with self._lock:
             self._refresh_portable()
             rows = [self._public(row) for row in self._rows.values()
-                if (not orphans or row.get('orphan')) and query.casefold() in (row['name'] + ' ' + row.get('path', '')).casefold()]
+                if (not orphans or row.get('orphan')) and (not config_only or row.get('config_only'))
+                and query.casefold() in (row['name'] + ' ' + row.get('path', '')).casefold()]
             rows.sort(key=lambda row: (row['source'], row['name'].casefold()))
             return {'total': len(rows), 'rows': rows[offset:offset + min(limit, 200)]}
 
@@ -334,14 +360,14 @@ class DependencyService:
             raise ValueError('每次请选择一个具有正式卸载入口的桌面应用')
         return rows
 
-    def _apt_plan(self, rows):
-        command = ['/usr/bin/apt-get', '-s', 'remove', '--', *[row['name'] for row in rows]]
+    def _apt_plan(self, rows, mode, installed):
+        command = ['/usr/bin/apt-get', '-s', mode, '--', *[row['name'] for row in rows]]
         output = self._run(command)
-        changes = [line.strip() for line in output.splitlines() if re.match(r'^(Remv|Inst|Conf) ', line)]
-        if any(not line.startswith('Remv ') for line in changes):
+        changes = [line.strip() for line in output.splitlines() if re.match(r'^(Remv|Purg|Inst|Conf) ', line)]
+        if any(not line.startswith(('Remv ', 'Purg ')) for line in changes):
             raise ValueError('此次卸载模拟包含安装或配置操作，请在系统包管理器中处理')
         affected = []
-        lookup = self._apt_names(self._rows.values())
+        lookup = self._apt_names(installed.values())
         for line in changes:
             name = line.split()[1]
             row = lookup.get(name)
@@ -352,17 +378,24 @@ class DependencyService:
             affected.append(self._public(row))
         if not affected:
             raise ValueError('模拟没有待卸载包，请重新扫描')
+        if not {row['id'] for row in rows}.issubset(row['id'] for row in affected):
+            raise ValueError('模拟未覆盖所选应用，包登记已经变化，请重新预览')
         return changes, affected
 
-    def preview(self, ids):
+    def preview(self, ids, purge=False):
         with self._lock:
             if self._busy:
                 raise ValueError('请等待依赖扫描完成')
             rows = self._selection(ids)
             source = rows[0]['source']
+            if type(purge) is not bool or (purge and source != 'APT'):
+                raise ValueError('仅 APT 可选择同时清除已登记配置')
+            if not purge and any(row.get('config_only') for row in rows):
+                raise ValueError('这个软件包只剩配置，请使用清除配置')
+            mode = 'purge' if purge else 'remove'
             if source == 'APT':
-                changes, affected = self._apt_plan(rows)
-                permission = '需要 root 权限；非 root 通过系统 pkexec 授权；无授权入口则拒绝执行'
+                changes, affected = self._apt_plan(rows, mode, self._rows)
+                permission = 'APT 将请求管理员授权。'
             else:
                 changes, affected = [], [self._public(row) for row in rows]
                 selected = {row['id'] for row in rows}
@@ -370,10 +403,14 @@ class DependencyService:
                     raise ValueError('仍有已知 AppX 反向依赖，请先在系统设置中处理')
                 permission = '当前用户 AppX 正规卸载' if source == 'AppX' else '打开登记的卸载程序；可能弹出系统权限或应用确认窗口'
             token = uuid.uuid4().hex
-            result = {'token': token, 'source': source, 'affected': affected, 'changes': changes,
-                'count': len(affected), 'space_bytes_estimate': sum(row.get('installed_size', 0) for row in affected) if source == 'APT' else None,
-                'permission': permission, 'message': '正式卸载软件包/应用，不能从应用回收站恢复；用户数据不在此处推测清理。'}
-            self._previews = {token: {'ids': [row['id'] for row in rows], 'source': source,
+            config_only = all(row.get('config_only') for row in affected)
+            estimate = None
+            if source == 'APT' and not any(row.get('config_only') for row in affected):
+                estimate = sum(row.get('installed_size', 0) for row in affected)
+            result = {'token': token, 'source': source, 'purge': purge, 'config_only': config_only,
+                'affected': affected, 'changes': changes, 'count': len(affected), 'space_bytes_estimate': estimate,
+                'permission': permission, 'message': 'APT 将永久删除这些包登记的剩余配置。' if config_only else '以下应用将正式卸载。'}
+            self._previews = {token: {'ids': [row['id'] for row in rows], 'source': source, 'mode': mode,
                 'signatures': [(row['id'], row.get('version'), row.get('uninstall_command')) for row in rows],
                 'changes': changes, 'result': result}}
             return result
@@ -388,21 +425,26 @@ class DependencyService:
             if self._busy:
                 raise ValueError('请等待依赖扫描完成')
             rows = self._selection(preview['ids'])
+            notes, owned = [], []
+            fresh, _ = self._collect()
             if preview['source'] == 'APT':
-                changes, _ = self._apt_plan(rows)
-                if changes != preview['changes']:
+                changes, affected = self._apt_plan(rows, preview['mode'], fresh)
+                versions = [(row['id'], row['version']) for row in affected]
+                if changes != preview['changes'] or versions != [(row['id'], row['version']) for row in preview['result']['affected']]:
                     raise ValueError('包管理器模拟结果已经变化，请重新预览并确认')
-                command = ['/usr/bin/apt-get', '--assume-yes', '--no-download', 'remove', '--', *[row['name'] for row in rows]]
+                command = ['/usr/bin/apt-get', '--assume-yes', '--no-download', preview['mode'], '--', *[row['name'] for row in rows]]
                 if not hasattr(os, 'geteuid') or os.geteuid() != 0:
                     authorization = shutil.which('pkexec')
                     if not authorization:
                         raise PermissionError('未获 root 权限且没有 pkexec 系统授权入口；未执行卸载，请在系统包管理器中操作')
                     command.insert(0, authorization)
+                owned = apt_manifest(self._run, affected, notes)
+                caches = user_cache_manifest(self._run, affected, notes)
             else:
-                fresh, _ = self._collect()
                 signatures = [(id, fresh.get(id, {}).get('version'), fresh.get(id, {}).get('uninstall_command')) for id in preview['ids']]
                 if signatures != preview['signatures'] or any(id not in fresh for id in preview['ids']):
                     raise ValueError('应用登记已经变化，请重新预览并确认')
+                rows = [fresh[id] for id in preview['ids']]
                 if preview['source'] == 'AppX':
                     if any(fresh[id].get('system') or fresh[id].get('framework') or
                            any(id in (row.get('dependencies') or []) and row['id'] not in preview['ids'] for row in fresh.values()) for id in preview['ids']):
@@ -414,8 +456,10 @@ class DependencyService:
                     # Windows CreateProcess receives the registered command line verbatim.
                     # shell=False: no cmd.exe wrapper and no interpolated shell command.
                     command = rows[0]['uninstall_command']
+                    owned = desktop_manifest(rows[0], fresh, notes)
             self._previews.pop(token)
-        error, output = '', ''
+            self._busy = True
+        error, output, verified = '', '', False
         try:
             # Official uninstallers may wait for an interactive OS/application dialog.
             # Do not terminate an installer because a metadata-query timeout elapsed.
@@ -429,14 +473,113 @@ class DependencyService:
                     self._rows, self._errors = fresh, errors
                     self._rebuild()
                     self._generation += 1
+                    verified = True
             except (OSError, ValueError, subprocess.SubprocessError) as failure:
                 error = (error + '\n刷新包数据库：' + str(failure)).strip()
         with self._lock:
-            remaining = [id for id in preview['ids'] if id in self._rows]
-            self._result = {'completed': not error and not remaining, 'remaining': remaining,
+            self._busy = False
+            remaining = [row['id'] for row in preview['result']['affected'] if row['id'] in self._rows] if verified else []
+            if verified and preview['mode'] == 'purge':
+                affected_names = {row['name'] for row in preview['result']['affected']}
+                remaining = [row['id'] for row in self._rows.values()
+                             if row['source'] == 'APT' and row['name'] in affected_names]
+            completed = verified and not error and not remaining
+            self._residues = None
+            if completed:
+                entries = []
+                if preview['source'] == 'APT':
+                    for entry in owned:
+                        try:
+                            if (file_identity(entry['path']) == entry['identity'] and
+                                    apt_owner(self._run, entry['path'], entry['dpkg_owner'], allow_missing=True)):
+                                entries.append(entry)
+                        except (FileNotFoundError, ValueError):
+                            continue
+                        except OSError as failure:
+                            notes.append(f"{entry['path']} 无法核验：{failure}")
+                    if caches:
+                        try:
+                            status = cache_status(self._run)
+                            for cache in caches:
+                                try:
+                                    check_user_cache(cache, *status)
+                                    entries.extend(cache_files(Path(cache['cache_root']), cache, notes))
+                                except FileNotFoundError:
+                                    continue
+                                except (ValueError, OSError) as failure:
+                                    notes.append(str(failure))
+                        except (ValueError, OSError) as failure:
+                            notes.append(f'无法核验 systemd 用户缓存：{failure}')
+                    scope = '检查 dpkg 登记的 /etc 配置和 systemd 用户服务明确声明的独占缓存。'
+                elif preview['source'] == 'AppX':
+                    entries = appx_cache(rows, self._rows, notes)
+                    scope = '仅列出当前用户包系列的 LocalCache 和 TempState 普通文件。'
+                else:
+                    for entry in owned:
+                        path = Path(entry['path'])
+                        try:
+                            if file_identity(path) == entry['identity'] and not desktop_shared(path, self._rows, entry['package']):
+                                entries.append(entry)
+                        except FileNotFoundError:
+                            continue
+                        except (OSError, ValueError) as failure:
+                            notes.append(str(failure))
+                    scope = '检查卸载登记中引用的程序、图标和卸载器。'
+                self._residues = ResiduePreview(entries, [*dict.fromkeys(notes), scope], not notes)
+            self._result = {'completed': completed, 'verified': verified, 'remaining': remaining,
+                'residues': self._residues.public(False) if self._residues else None,
                 'output': output[-2000:], 'error': error,
-                'message': '卸载入口已返回，已重新查询登记；仍登记的应用未标记为卸载成功。' if remaining else '卸载入口已返回并重新查询登记。'}
-            return dict(self._result)
+                'message': '已重新查询登记并确认卸载。' if completed else '未能确认卸载成功，未扫描残留。'}
+            return {**self._result, 'residues': self.residues()}
+
+    def residues(self):
+        with self._lock:
+            return self._residues.public() if self._residues else None
+
+    def residue_recycle(self, token, ids, confirmed=False):
+        with self._lock:
+            preview = self._residues
+            if (confirmed is not True or preview is None or token != preview.token or self._busy or not isinstance(ids, list)
+                    or not ids or not all(isinstance(i, str) and i in preview.entries for i in ids)
+                    or len(set(ids)) != len(ids)):
+                raise ValueError('请选择当前残留预览中的文件并确认')
+            if self._recycle_residue is None:
+                raise ValueError('应用回收站尚未就绪')
+            installed, _ = self._collect()
+            families = {r.get('package_family_name', '').casefold() for r in installed.values()}
+            status, cache_error = None, ''
+            if any('cache_name' in preview.entries[i] for i in ids):
+                try:
+                    status = cache_status(self._run)
+                except (ValueError, OSError) as error:
+                    cache_error = str(error)
+            results, moved = [], 0
+            for key in ids:
+                item = preview.entries[key]
+                try:
+                    if item['package'] in installed or ('family' in item and item['family'].casefold() in families):
+                        raise ValueError('软件已重新登记或包系列仍在使用')
+                    if 'dpkg_owner' in item and not apt_owner(self._run, item['path'], item['dpkg_owner'], allow_missing=True):
+                        raise ValueError('配置文件归属已经变化或无法核验')
+                    if item.get('desktop') and desktop_shared(Path(item['path']), installed, item['package']):
+                        raise ValueError('文件已被其他应用登记')
+                    if 'cache_name' in item:
+                        if status is None:
+                            raise ValueError(f'无法核验用户缓存：{cache_error}')
+                        check_user_cache(item, *status)
+                    recycled = self._recycle_residue(item['path'], item['identity'])
+                    result = recycled['results'][0]
+                    moved += recycled['moved_bytes']
+                    if result['status'] == 'vaulted':
+                        del preview.entries[key]
+                except (OSError, ValueError) as error:
+                    result = dict(path=item['path'], status='failed', error=str(error))
+                results.append({**result, 'candidate_id': key})
+            success = sum(r['status'] == 'vaulted' for r in results)
+            self._result['residues'] = preview.public(False)
+            return dict(results=results, moved_bytes=moved, freed_bytes=0, success=success,
+                        failed=len(results)-success, residues=preview.public(),
+                        message=f'已回收 {success} 项，失败 {len(results)-success} 项；同卷回收尚未释放空间。')
 
     def _save(self):
         self._path.parent.mkdir(parents=True, exist_ok=True)

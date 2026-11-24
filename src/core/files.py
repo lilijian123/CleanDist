@@ -110,6 +110,10 @@ class CleanupReport:
         return sum(result.record.size for result in self.results if result.state == '成功')
 
 
+def stat_identity(info):
+    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
 def validate_plain_path(path):
     path = Path(os.path.abspath(path))
     for part in [*reversed(path.parents), path]:

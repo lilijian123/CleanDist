@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 
-from ...core.processes import matching_process, StopResult
+from ...core.processes import matching_process, StopResult, stop_descendants
 
 
 _kernel = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -49,7 +49,10 @@ def guard_process(key):
         _close(handle)
 
 
-def stop_process(key, *, force=False):
+def stop_process(key, *, force=False, descendants=False):
+    if descendants:
+        with guard_process(key):
+            return stop_descendants(key, lambda target: stop_process(target, force=force))
     with guard_process(key) as handle:
         command = [str(Path(os.environ['SystemRoot']) / 'System32' / 'taskkill.exe'), '/PID', str(key[0])]
         if force:

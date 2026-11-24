@@ -1,5 +1,6 @@
-"""Linux 适配入口：XDG应用、inotify通知与安全的单进程SIGTERM。"""
+"""Linux 适配入口：XDG应用、inotify通知与基于 pidfd 的进程结束。"""
 import os
+import signal
 from pathlib import Path
 from ..common import (
     FONT_FAMILY, SCAN_NAME, is_link, list_disks, process_options,
@@ -15,6 +16,7 @@ from .identity import process_created
 
 
 NAME = 'Linux'
+CAN_FORCE_STOP = hasattr(os, 'pidfd_open') and hasattr(signal, 'pidfd_send_signal')
 HAS_DISK_SCAN = False
 APP_SOURCES = ('桌面应用', 'Snap应用', 'Flatpak应用', '便携候选')
 APP_PUBLISHER_LABEL = '软件包维护者'

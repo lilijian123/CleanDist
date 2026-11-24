@@ -10,7 +10,7 @@ import BlockTrace from './BlockTrace.vue'
 const props = defineProps({ memory: { type: Object, default: () => ({}) }, ai: Object, boot: Object, control: Object })
 const emit = defineEmits(['error', 'settings', 'refresh'])
 const view = ref('list')
-const query = ref(''), sort = ref('rss'), processes = ref(), detail = ref(''), detailTab = ref('metrics'), trend = ref('rss'), stopping = ref(null), working = ref(false)
+const query = ref(''), sort = ref('rss'), processes = ref(), detail = ref(''), detailTab = ref('metrics'), trend = ref('rss'), stopping = ref(null), stopMessage = ref(''), working = ref(false)
 const selected = computed(() => props.memory.selected || {})
 const info = computed(() => selected.value.details || {})
 const report = computed(() => selected.value.report || {})
@@ -65,10 +65,11 @@ const localLoad = computed(() => {
   const rows = detailTab.value === 'threads' ? report.value.threads || [] : detailTab.value === 'files' ? report.value.open_files || [] : detailTab.value === 'trace' ? trace.value.events || [] : report.value.mappings || []
   return async ({ offset, limit }) => ({ total: rows.length, rows: rows.slice(offset, offset + limit) })
 })
-async function select(row) { try { await call('process_select', { key: row.key }); emit('refresh') } catch (error) { emit('error', error.message) } }
+async function select(row) { stopMessage.value = ''; try { await call('process_select', { key: row.key }); emit('refresh') } catch (error) { emit('error', error.message) } }
 async function stop() {
   working.value = true
-  try { await call('process_stop', { key: stopping.value.key, force: stopping.value.force, confirmed: true }); stopping.value = null; emit('refresh'); processes.value?.reload(false) }
+  stopMessage.value = ''
+  try { const result = await call('process_stop', { key: stopping.value.key, force: stopping.value.force, descendants: !!stopping.value.descendants, confirmed: true }); stopMessage.value = result.message; stopping.value = null; emit('refresh'); processes.value?.reload(false) }
   catch (error) { emit('error', error.message) }
   finally { working.value = false }
 }
@@ -100,7 +101,7 @@ defineExpose({ refresh: () => processes.value?.reload(false) })
               <button v-if="boot.can_force_stop" class="danger-quiet" @click="stopping = {key:[...selected.key],name:selected.name,force:true}">强制结束…</button>
             </div>
           </template>
-          <p v-if="selected.message" class="inline-note" role="status">{{ selected.message }}</p>
+          <p v-if="stopMessage || selected.message" class="inline-note" role="status">{{ stopMessage || selected.message }}</p>
         </section>
         <AiPanel compact :state="ai?.mode === 'cleanup' ? {} : ai" :has-key="boot.has_key" :selected="!!selected.key && !!selected.summary" @settings="emit('settings')" @error="emit('error',$event)"/>
         <ProcessGovernance v-if="selected.key" :memory="memory" :state="control || {}" :boot="boot" @error="emit('error',$event)" @refresh="emit('refresh')"/>
@@ -135,7 +136,7 @@ defineExpose({ refresh: () => processes.value?.reload(false) })
       <div v-else-if="detailTab === 'findings'" class="detail-scroll"><article v-for="(finding,index) in report.findings || []" :key="index" class="finding"><h3>{{ finding.title }}</h3><p>{{ finding.evidence }}</p></article><p v-if="!report.findings?.length" class="muted">继续采样后显示观察依据。</p><p v-for="(error,index) in report.errors || []" :key="index" class="muted">{{ error }}</p></div>
       <template v-else><div v-if="detailTab === 'trace'" class="toolbar"><button @click="toggleTrace">{{ trace.active ? '停止跟踪' : '开始文件跟踪' }}</button><span class="muted">{{ trace.status?.split('；读写系统调用')[0] }}</span><span v-if="trace.dropped" class="muted">丢弃 {{ trace.dropped }} 条</span></div><div class="list-header detail-grid"><span>{{ detailTab === 'threads' ? '线程 ID' : detailTab === 'trace' ? '操作 / TID' : '路径' }}</span><span>{{ detailTab === 'threads' ? '总 CPU' : detailTab === 'mappings' ? 'RSS / PSS' : detailTab === 'files' ? 'FD / 模式' : '字节 / 耗时' }}</span><span>{{ detailTab === 'threads' ? '用户 / 内核' : detailTab === 'mappings' ? '私有驻留' : detailTab === 'files' ? '偏移' : '路径' }}</span></div><VirtualList :key="detailTab" :load="localLoad" :revision="String(report.deep_at) + ':' + (trace.events?.length || 0)" empty="当前没有可读取的记录"><template #default="{row}"><div class="data-row detail-grid"><template v-if="detailTab === 'threads'"><span>{{ row.tid }}</span><span>{{ percentage(row.cpu_percent) }}</span><span>{{ percentage(row.user_percent) }} / {{ percentage(row.system_percent) }}</span></template><template v-else-if="detailTab === 'mappings'"><span class="truncate" :title="row.path">{{ row.path }}</span><span>{{ size(row.rss) }} / {{ size(row.pss) }}</span><span>{{ size(row.private) }}</span></template><template v-else-if="detailTab === 'files'"><span class="truncate" :title="row.path">{{ row.path }}</span><span>{{ row.fd }} / {{ row.mode || '—' }}</span><span>{{ number(row.position) }}</span></template><template v-else><span>{{ row.operation }} / {{ row.tid }}</span><span>{{ size(row.bytes_count) }} / {{ row.duration_seconds == null ? '—' : number(row.duration_seconds * 1000) + 'ms' }}</span><span class="truncate" :title="row.path">{{ row.path }}</span></template></div></template></VirtualList></template>
     </section></div>
-    <div v-if="stopping" class="modal-backdrop"><section class="modal small" role="alertdialog" aria-modal="true"><h2>{{ stopping.force ? '强制结束进程？' : '结束进程？' }}</h2><p>{{ stopping.name }} · PID {{ stopping.key[0] }}</p><p>{{ stopping.force ? '强制结束不会等待程序正常退出，未保存的数据可能丢失。' : '程序可能有未保存的数据。请确认已经完成保存。' }}</p><div class="modal-actions"><button :disabled="working" @click="stopping = null">取消</button><button class="danger" :disabled="working" @click="stop">{{ working ? '正在结束…' : stopping.force ? '确认强制结束' : '确认结束' }}</button></div></section></div></Teleport>
+    <div v-if="stopping" class="modal-backdrop"><section class="modal small" role="alertdialog" aria-modal="true"><h2>{{ stopping.force ? '强制结束进程？' : '结束进程？' }}</h2><p>{{ stopping.name }} · PID {{ stopping.key[0] }}</p><p>{{ stopping.force ? '强制结束不会等待程序正常退出，未保存的数据可能丢失。' : '程序可能有未保存的数据。请确认已经完成保存。' }}</p><label><input type="checkbox" v-model="stopping.descendants" :disabled="working"> 同时结束确认时可见的所有后代进程</label><div class="modal-actions"><button :disabled="working" @click="stopping = null">取消</button><button class="danger" :disabled="working" @click="stop">{{ working ? '正在结束…' : stopping.force ? '确认强制结束' : '确认结束' }}</button></div></section></div></Teleport>
   </div>
 </template>
 

@@ -24,7 +24,8 @@ class DesktopApi:
         self._apps = apps or AppService()
         self._control = control or ProcessControl()
         self._directories = directories or DirectoryService()
-        self._dependencies = dependencies or DependencyService(self._directories.preview)
+        self._dependencies = dependencies or DependencyService(self._directories.preview,
+            recycle_residue=self._directories.recycle_residue)
         self._processes.set_trace_listener(self._directories.notify)
         self._ai = AiService()
         self._window = None
@@ -99,6 +100,8 @@ class DesktopApi:
             'deps_scan': self._dependencies.scan, 'deps_rows': self._dependencies.rows,
             'deps_details': self._dependencies.details, 'deps_preview': self._dependencies.preview,
             'deps_uninstall': self._dependencies.uninstall,
+            'deps_residues': self._dependencies.residues,
+            'deps_residue_recycle': self._dependencies.residue_recycle,
             'portable_register': self._dependencies.portable_register,
             'portable_keep': self._dependencies.portable_keep,
             'portable_preview': self._dependencies.portable_preview,
